@@ -2,7 +2,7 @@
 
 > **English** | [Bahasa Indonesia](#bahasa-indonesia)
 
-[![CI](https://github.com/yourusername/LogaL/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/LogaL/actions/workflows/ci.yml)
+[![CI](https://github.com/mtommyp14/LogaL/actions/workflows/ci.yml/badge.svg)](https://github.com/mtommyp14/LogaL/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-13+-4169E1?logo=postgresql&logoColor=white)](https://postgresql.org)
@@ -10,7 +10,7 @@
 
 **Dark-themed web UI for tailing Kubernetes pod logs in real-time with history support.**
 
-Powered by [`stern`](https://github.com/stern/stern) on the backend, a single Go binary, and PostgreSQL storage. Multi-replica ready, no database knowledge required to run it.
+Powered by [`stern`](https://github.com/stern/stern) on the backend, a single Go binary, and PostgreSQL storage. Multi-replica ready.
 
 ---
 
@@ -123,7 +123,7 @@ Custom range mode:
 
 ```bash
 # Clone
-git clone https://github.com/yourusername/LogaL.git
+git clone https://github.com/mtommyp14/LogaL.git
 cd LogaL
 
 # Download dependencies
@@ -260,7 +260,7 @@ This project is licensed under the [MIT License](LICENSE).
 
 > [English](#logal-kubernetes-log-viewer) | **Bahasa Indonesia**
 
-[![CI](https://github.com/yourusername/LogaL/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/LogaL/actions/workflows/ci.yml)
+[![CI](https://github.com/mtommyp14/LogaL/actions/workflows/ci.yml/badge.svg)](https://github.com/mtommyp14/LogaL/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-13+-4169E1?logo=postgresql&logoColor=white)](https://postgresql.org)
@@ -381,7 +381,7 @@ Mode custom range:
 
 ```bash
 # Clone
-git clone https://github.com/yourusername/LogaL.git
+git clone https://github.com/mtommyp14/LogaL.git
 cd LogaL
 
 # Download dependencies
