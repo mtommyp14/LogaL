@@ -1,0 +1,45 @@
+# Binaries
+logal
+logal-migrate
+logt
+main
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Go workspace
+go.work
+
+# Dependency directories
+vendor/
+
+# Local env files
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local log dirs (if running locally with flat file mode)
+/tmp/logal-logs
+/tmp/logt-logs
+/data/logs
+
+# Build artifacts
+dist/
+build/

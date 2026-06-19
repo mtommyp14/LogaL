@@ -1,0 +1,177 @@
+# LogaL — All-in-one Kubernetes manifest
+# Includes: Namespace, RBAC, Deployment, Service
+#
+# Requirements: PostgreSQL database. Set DATABASE_URL via secret before applying.
+#
+# Single cluster (in-cluster):
+#   kubectl create secret generic logal-db \
+#     --from-literal=url="postgres://user:pass@host:5432/logal" -n logging
+#   kubectl apply -f deployment.yaml
+#
+# Multi-cluster (with kubeconfig):
+#   kubectl create secret generic logal-kubeconfig \
+#     --from-file=config=./merged-kubeconfig -n logging
+#   kubectl apply -f deployment.yaml
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+
+---
+# ── ServiceAccount ────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: logal
+  namespace: logging
+
+---
+# ── ClusterRole (read-only: pods, logs, namespaces, workloads) ─────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: logal-role
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+  verbs: ["get", "list"]
+
+---
+# ── ClusterRoleBinding ────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: logal-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: logal-role
+subjects:
+- kind: ServiceAccount
+  name: logal
+  namespace: logging
+
+---
+# ── Deployment ────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logal
+  namespace: logging
+  labels:
+    app: logal
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: logal
+  template:
+    metadata:
+      labels:
+        app: logal
+    spec:
+      serviceAccountName: logal
+
+      containers:
+      - name: logal
+        image: your-registry/logal:latest  # ganti dengan image kamu
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+
+        env:
+        - name: PORT
+          value: "8080"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: logal-db
+              key: url
+        - name: LOG_RETENTION_DAYS
+          value: "3"
+        # Uncomment untuk multi-cluster:
+        # - name: KUBECONFIG
+        #   value: "/kubeconfig/config"
+        # Uncomment untuk restrict namespace:
+        # - name: ALLOWED_NAMESPACES
+        #   value: "staging,n8n-devops,production"
+
+        volumeMounts:
+        # Uncomment untuk multi-cluster:
+        # - name: kubeconfig
+        #   mountPath: /kubeconfig
+        #   readOnly: true
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+
+      volumes:
+      # Uncomment untuk multi-cluster:
+      # - name: kubeconfig
+      #   secret:
+      #     secretName: logal-kubeconfig
+
+---
+# ── Service ───────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: logal
+  namespace: logging
+spec:
+  selector:
+    app: logal
+  ports:
+  - port: 80
+    targetPort: 8080
+    name: http
+  type: ClusterIP
+
+---
+# ── Ingress (optional, uncomment dan sesuaikan) ───────────────────────────────
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: logal
+#   namespace: logging
+#   annotations:
+#     nginx.ingress.kubernetes.io/proxy-buffering: "off"      # penting untuk SSE
+#     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"  # penting untuk SSE
+# spec:
+#   ingressClassName: nginx
+#   rules:
+#   - host: logal.internal.example.com
+#     http:
+#       paths:
+#       - path: /
+#         pathType: Prefix
+#         backend:
+#           service:
+#             name: logal
+#             port:
+#               number: 80

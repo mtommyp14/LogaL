@@ -1,0 +1,1743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LogaL — Kubernetes Log Viewer</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d0d0d'/%3E%3Crect x='1' y='1' width='30' height='30' rx='5' fill='none' stroke='%2358a6ff' stroke-width='1.5' opacity='0.4'/%3E%3C!-- bracket left --%3E%3Cpath d='M8 6 L5 6 L5 26 L8 26' stroke='%2358a6ff' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C!-- bracket right --%3E%3Cpath d='M24 6 L27 6 L27 26 L24 26' stroke='%2358a6ff' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C!-- L normal --%3E%3Cpath d='M11 8 L11 20 L17 20' stroke='%23e6edf3' stroke-width='2.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C!-- L flipped (mirrored) --%3E%3Cpath d='M21 8 L21 20 L15 20' stroke='%2358a6ff' stroke-width='2.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C!-- center dot --%3E%3Ccircle cx='16' cy='20' r='1.2' fill='%2358a6ff'/%3E%3C/svg%3E">
+<style>
+  /* ── Reset & Base ── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:          #0d0d0d;
+    --surface:     #161616;
+    --surface2:    #1e1e1e;
+    --border:      #2a2a2a;
+    --border2:     #383838;
+    --text:        #e0e0e0;
+    --text-dim:    #888888;
+    --text-dimmer: #555555;
+    --accent:      #4f9cf9;
+    --accent-dim:  #1e3a5f;
+    --error:       #f85149;
+    --warn:        #d29922;
+    --success:     #3fb950;
+    --pod-colors:  #79c0ff, #a5d6ff, #d2a8ff, #ffa657, #7ee787, #ff7b72, #f0883e, #56d364;
+  }
+
+  html, body { height: 100%; overflow: hidden; }
+
+  body {
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  /* ── Layout ── */
+  .app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+
+  /* ── Header ── */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+
+  .logo {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+
+  .logo-text {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 1px;
+  }
+
+  .logo-bracket { color: var(--accent); }
+  .logo-name { color: var(--text); }
+
+  .logo-tagline {
+    font-size: 11px;
+    color: var(--text-dimmer);
+    letter-spacing: 0.5px;
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-dimmer);
+    display: inline-block;
+    margin-right: 5px;
+  }
+  .status-dot.active { background: var(--success); box-shadow: 0 0 6px var(--success); }
+  .status-dot.loading { background: var(--warn); animation: pulse 1s infinite; }
+
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+  /* ── Controls ── */
+  .controls {
+    padding: 14px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .controls-row {
+    display: flex;
+    gap: 12px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .controls-row:last-child { margin-bottom: 0; }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .field label {
+    font-size: 10px;
+    color: var(--text-dimmer);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    font-weight: 600;
+  }
+
+  select, input[type=text] {
+    background: var(--surface2);
+    border: 1px solid var(--border2);
+    color: var(--text);
+    padding: 6px 10px;
+    border-radius: 5px;
+    font-family: inherit;
+    font-size: 12px;
+    outline: none;
+    transition: border-color .15s;
+    min-width: 140px;
+  }
+
+  select:focus, input[type=text]:focus {
+    border-color: var(--accent);
+  }
+
+  select option { background: var(--surface2); }
+
+  /* Autocomplete wrapper */
+  .autocomplete-wrap {
+    position: relative;
+  }
+
+  .autocomplete-wrap input {
+    width: 200px;
+    padding-right: 28px;
+  }
+
+  .autocomplete-list {
+    display: none;
+    position: absolute;
+    top: calc(100% + 2px);
+    left: 0;
+    right: 0;
+    background: var(--surface2);
+    border: 1px solid var(--border2);
+    border-radius: 5px;
+    z-index: 100;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
+  .autocomplete-list.open { display: block; }
+
+  .autocomplete-section {
+    padding: 4px 0;
+  }
+
+  .autocomplete-section-label {
+    padding: 4px 10px 2px;
+    font-size: 10px;
+    color: var(--text-dimmer);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .autocomplete-item {
+    padding: 5px 12px;
+    cursor: pointer;
+    transition: background .1s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .autocomplete-item:hover,
+  .autocomplete-item.selected { background: var(--accent-dim); color: var(--accent); }
+
+  /* ── Buttons ── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 6px 14px;
+    border-radius: 5px;
+    border: 1px solid var(--border2);
+    background: var(--surface2);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all .15s;
+    white-space: nowrap;
+  }
+
+  .btn:hover { border-color: var(--text-dim); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+  .btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #000;
+    font-weight: 600;
+  }
+  .btn-primary:hover { background: #6aaeff; border-color: #6aaeff; }
+
+  .btn-danger {
+    border-color: var(--error);
+    color: var(--error);
+  }
+  .btn-danger:hover { background: rgba(248,81,73,.1); }
+
+  .btn-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+  }
+
+  /* ── Banner ── */
+  .banner {
+    display: none;
+    padding: 7px 20px;
+    font-size: 11px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .banner.show { display: flex; }
+  .banner-info { color: var(--text-dim); }
+  .banner-info b { color: var(--text); }
+  .banner-warn { color: var(--warn); }
+  .banner-icon { font-size: 13px; }
+
+  /* ── Pod/Container Selectors ── */
+  .selectors {
+    display: none;
+    padding: 8px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    gap: 20px;
+  }
+  .selectors.show { display: flex; }
+
+  .selector-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1;
+  }
+
+  .selector-group-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 10px;
+    color: var(--text-dimmer);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    font-weight: 600;
+  }
+
+  .selector-group-header .toggle-links {
+    display: flex;
+    gap: 8px;
+  }
+
+  .toggle-link {
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 10px;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .toggle-link:hover { text-decoration: underline; }
+
+  .selector-items {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .selector-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    border-radius: 4px;
+    border: 1px solid var(--border2);
+    background: var(--surface2);
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--text-dim);
+    transition: all .1s;
+    user-select: none;
+  }
+
+  .selector-chip.checked {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-dim);
+  }
+
+  .selector-chip.sidecar { opacity: .75; border-style: dashed; }
+  .selector-chip.sidecar.checked { opacity: 1; border-style: solid; }
+
+  .chip-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+  }
+
+  /* ── Warning modal ── */
+  .warning-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.7);
+    z-index: 200;
+    align-items: center;
+    justify-content: center;
+  }
+  .warning-overlay.show { display: flex; }
+
+  .warning-box {
+    background: var(--surface);
+    border: 1px solid var(--warn);
+    border-radius: 8px;
+    padding: 24px;
+    max-width: 420px;
+    width: 90%;
+  }
+
+  .warning-box h3 {
+    color: var(--warn);
+    margin-bottom: 12px;
+    font-size: 14px;
+  }
+
+  .warning-box p {
+    color: var(--text-dim);
+    margin-bottom: 16px;
+    line-height: 1.6;
+    font-size: 12px;
+  }
+
+  .warning-box .btns {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+  }
+
+  /* ── Log area ── */
+  .log-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .log-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 14px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .log-toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .log-count {
+    font-size: 11px;
+    color: var(--text-dimmer);
+  }
+
+  .autoscroll-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-dimmer);
+    cursor: pointer;
+    padding: 2px 8px;
+    border-radius: 3px;
+    border: 1px solid transparent;
+    transition: all .1s;
+    user-select: none;
+  }
+
+  .autoscroll-btn.on {
+    color: var(--success);
+    border-color: rgba(63,185,80,.3);
+    background: rgba(63,185,80,.08);
+  }
+
+  .log-toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .btn-icon {
+    padding: 4px 8px;
+    font-size: 11px;
+  }
+
+  /* Virtual scroll container */
+  .log-outer {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: auto;
+    position: relative;
+    scroll-behavior: auto;
+  }
+
+  .log-outer::-webkit-scrollbar { width: 6px; height: 6px; }
+  .log-outer::-webkit-scrollbar-track { background: transparent; }
+  .log-outer::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+  .log-content {
+    padding: 8px 0;
+    min-width: max-content;
+  }
+
+  .log-line {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    padding: 2px 14px;
+    line-height: 1.5;
+    white-space: pre;
+    font-size: 12px;
+    transition: background .1s;
+  }
+
+  .log-line:hover { background: rgba(255,255,255,.03); }
+
+  .log-ts {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: flex-end;
+    margin-right: 10px;
+    flex-shrink: 0;
+    line-height: 1.3;
+    gap: 0;
+    align-self: center;
+  }
+  .log-ts .ts-ago {
+    font-size: 9px;
+    color: var(--text-dimmer);
+    opacity: 0.6;
+    font-style: italic;
+    white-space: nowrap;
+  }
+  .log-ts .ts-time {
+    font-size: 11px;
+    color: var(--text-dimmer);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .log-ts .ts-date {
+    font-size: 9px;
+    color: var(--text-dimmer);
+    opacity: 0.55;
+    white-space: nowrap;
+  }
+
+  .log-pod {
+    margin-right: 8px;
+    flex-shrink: 0;
+    font-weight: 600;
+    font-size: 11px;
+  }
+
+  .log-container {
+    margin-right: 10px;
+    flex-shrink: 0;
+    color: var(--text-dimmer);
+    font-size: 11px;
+  }
+
+  .log-msg { color: var(--text); }
+
+  /* Log level highlights */
+  .log-line.level-error .log-msg { color: var(--error); }
+  .log-line.level-warn  .log-msg { color: var(--warn); }
+  .log-line.level-info  .log-msg { color: var(--success); }
+
+  .log-level-badge {
+    display: inline-block;
+    padding: 0 5px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 700;
+    margin-right: 6px;
+    flex-shrink: 0;
+  }
+
+  .badge-error { background: rgba(248,81,73,.2); color: var(--error); }
+  .badge-warn  { background: rgba(210,153,34,.2); color: var(--warn); }
+  .badge-info  { background: rgba(63,185,80,.2); color: var(--success); }
+
+  /* ── Empty state ── */
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-dimmer);
+    gap: 12px;
+  }
+
+  .empty-logo {
+    font-size: 32px;
+    font-weight: 700;
+    letter-spacing: 2px;
+  }
+  .empty-logo .b { color: var(--accent); }
+
+  .empty-hint { font-size: 12px; }
+
+  /* ── Toast ── */
+  .toast {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: var(--surface2);
+    border: 1px solid var(--border2);
+    color: var(--text);
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 12px;
+    opacity: 0;
+    transform: translateY(10px);
+    transition: all .2s;
+    z-index: 300;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+
+  /* ── Divider ── */
+  .history-divider {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 14px;
+    color: var(--text-dimmer);
+    font-size: 11px;
+    border-top: 1px dashed var(--border2);
+    border-bottom: 1px dashed var(--border2);
+    background: rgba(79,156,249,.03);
+    margin: 2px 0;
+  }
+
+  .divider-line { flex: 1; height: 1px; background: var(--border); }
+
+  .date-divider {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 14px;
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    border-top: 1px solid rgba(79,156,249,.2);
+    border-bottom: 1px solid rgba(79,156,249,.2);
+    background: rgba(79,156,249,.04);
+    margin: 6px 0;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  .date-divider .divider-line { background: rgba(79,156,249,.25); }
+
+  .restart-divider {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 14px;
+    color: var(--warn);
+    font-size: 11px;
+    font-weight: 600;
+    border-top: 1px solid rgba(210,153,34,.3);
+    border-bottom: 1px solid rgba(210,153,34,.3);
+    background: rgba(210,153,34,.06);
+    margin: 4px 0;
+  }
+  .restart-divider .divider-line { background: rgba(210,153,34,.3); }
+
+  /* ── Scrollback button ── */
+  .scroll-bottom-btn {
+    position: absolute;
+    bottom: 16px;
+    right: 22px;
+    background: var(--accent);
+    color: #000;
+    border: none;
+    border-radius: 20px;
+    padding: 5px 14px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    display: none;
+    font-family: inherit;
+    box-shadow: 0 2px 8px rgba(0,0,0,.4);
+    transition: all .15s;
+  }
+  .scroll-bottom-btn:hover { background: #6aaeff; }
+  .scroll-bottom-btn.show { display: block; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Header -->
+  <header class="header">
+    <div class="logo">
+      <div class="logo-text">
+        <span class="logo-bracket">[</span>
+        <span class="logo-name">Loga<span style="display:inline-block;transform:scaleX(-1)">L</span></span>
+        <span class="logo-bracket">]</span>
+      </div>
+      <div class="logo-tagline">kubernetes log viewer</div>
+    </div>
+    <div class="header-right">
+      <span id="statusIndicator">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">idle</span>
+      </span>
+      <span id="tzDisplay"></span>
+      <span>v1.0.0</span>
+    </div>
+  </header>
+
+  <!-- Controls -->
+  <div class="controls">
+    <div class="controls-row">
+      <!-- Cluster -->
+      <div class="field">
+        <label>Cluster</label>
+        <select id="ctxSelect" onchange="onContextChange()">
+          <option value="">Loading...</option>
+        </select>
+      </div>
+
+      <!-- Namespace -->
+      <div class="field">
+        <label>Namespace</label>
+        <select id="nsSelect" onchange="onNamespaceChange()">
+          <option value="">Select cluster first</option>
+        </select>
+      </div>
+
+      <!-- Workload Type -->
+      <div class="field">
+        <label>Type</label>
+        <select id="kindSelect" onchange="onNamespaceChange()">
+          <option value="">All</option>
+          <option value="Deployment">Deployment</option>
+          <option value="StatefulSet">StatefulSet</option>
+          <option value="DaemonSet">DaemonSet</option>
+        </select>
+      </div>
+
+      <!-- Workload with autocomplete -->
+      <div class="field">
+        <label>Service / Workload</label>
+        <div class="autocomplete-wrap">
+          <input type="text" id="workloadInput" placeholder="Type to search..." autocomplete="off"
+            oninput="onWorkloadInput()" onkeydown="onWorkloadKeydown(event)" onfocus="showSuggestions()" onblur="hideSuggestionsDelayed()">
+          <div class="autocomplete-list" id="autocompleteList"></div>
+        </div>
+      </div>
+
+      <!-- Filter -->
+      <div class="field">
+        <label>Filter (grep)</label>
+        <input type="text" id="filterInput" placeholder="error, timeout, ..." style="min-width:160px"
+          onkeydown="if(event.key==='Enter') startStream()">
+      </div>
+    </div>
+
+    <div class="controls-row">
+      <!-- Time Range -->
+      <div class="field">
+        <label>Time Range</label>
+        <select id="sinceSelect" onchange="onSinceChange()">
+          <option value="realtime">Real-time</option>
+          <option value="30m">Last 30 minutes</option>
+          <option value="1h">Last 1 hour</option>
+          <option value="6h">Last 6 hours</option>
+          <option value="1d">Last 1 day</option>
+          <option value="2d">Last 2 days</option>
+          <option value="3d">Last 3 days (max)</option>
+          <option value="custom">Custom range...</option>
+        </select>
+      </div>
+
+      <!-- Datetime Range -->
+      <div class="field" id="dateRangeField" style="display:none">
+        <label>From <span style="color:var(--text-dimmer);font-weight:400;font-size:10px" id="dtFromUtcHint"></span></label>
+        <input type="datetime-local" id="dtFrom" style="min-width:170px;background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:6px;padding:5px 8px;font-size:12px;font-family:inherit" onchange="onDateRangeChange()">
+      </div>
+      <div class="field" id="dateRangeFieldTo" style="display:none">
+        <label>To <span style="color:var(--text-dimmer);font-weight:400;font-size:10px" id="dtToUtcHint"></span></label>
+        <input type="datetime-local" id="dtTo" style="min-width:170px;background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:6px;padding:5px 8px;font-size:12px;font-family:inherit" onchange="onDateRangeChange()">
+      </div>
+
+      <!-- Tail -->
+      <div class="field">
+        <label>Tail Lines</label>
+        <select id="tailSelect">
+          <option value="50">50 lines</option>
+          <option value="100">100 lines</option>
+          <option value="500">500 lines</option>
+          <option value="1000">1000 lines</option>
+          <option value="0">All</option>
+        </select>
+      </div>
+
+      <!-- Actions -->
+      <div class="btn-actions">
+        <button class="btn btn-primary" id="startBtn" onclick="startStream()">▶ Start</button>
+        <button class="btn btn-danger" id="stopBtn" onclick="stopStream(true)" disabled>■ Stop</button>
+        <button class="btn" onclick="clearLogs()">⌫ Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Banner -->
+  <div class="banner" id="banner">
+    <span class="banner-icon">ⓘ</span>
+    <span class="banner-info" id="bannerText"></span>
+    <span class="banner-warn" id="bannerWarn"></span>
+  </div>
+
+  <!-- Pod/Container Selectors -->
+  <div class="selectors" id="selectors">
+    <div class="selector-group">
+      <div class="selector-group-header">
+        <span>Pods</span>
+        <div class="toggle-links">
+          <span class="toggle-link" onclick="toggleAllPods(true)">all</span>
+          <span class="toggle-link" onclick="toggleAllPods(false)">none</span>
+        </div>
+      </div>
+      <div class="selector-items" id="podChips"></div>
+    </div>
+    <div class="selector-group">
+      <div class="selector-group-header">
+        <span>Containers <span style="color:var(--text-dimmer);font-weight:400;text-transform:none;letter-spacing:0">(pilih satu)</span></span>
+      </div>
+      <div class="selector-items" id="containerChips"></div>
+    </div>
+  </div>
+
+  <!-- Warning overlay (high volume) -->
+  <div class="warning-overlay" id="warningOverlay">
+    <div class="warning-box">
+      <h3>⚠ High Log Volume</h3>
+      <p id="warningText"></p>
+      <div class="btns">
+        <button class="btn" onclick="dismissWarning()">Atur Dulu</button>
+        <button class="btn btn-primary" onclick="proceedStream()">Lanjutkan</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Log area -->
+  <div class="log-wrap">
+    <div class="log-toolbar">
+      <div class="log-toolbar-left">
+        <span class="log-count" id="lineCount">0 lines</span>
+        <span class="autoscroll-btn on" id="autoscrollBtn" onclick="toggleAutoScroll()">
+          ↓ auto-scroll
+        </span>
+      </div>
+      <div class="log-toolbar-right">
+        <button class="btn btn-icon" onclick="copyLogs()" title="Copy logs">⎘ Copy</button>
+        <button class="btn btn-icon" onclick="downloadLogs()" title="Download .log">↓ Download</button>
+      </div>
+    </div>
+
+    <div class="log-outer" id="logOuter">
+      <div class="log-content" id="logContent">
+        <div class="empty-state" id="emptyState">
+          <div class="empty-logo"><span class="b">[</span> Loga<span style="display:inline-block;transform:scaleX(-1)">L</span> <span class="b">]</span></div>
+          <div class="empty-hint">Select a workload and press Start</div>
+        </div>
+      </div>
+    </div>
+
+    <button class="scroll-bottom-btn" id="scrollBottomBtn" onclick="scrollToBottom()">↓ Back to live</button>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast"></div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────────
+let eventSource = null;
+let autoScroll = true;
+let lineCount = 0;
+let allLogs = [];
+let pendingStreamParams = null;
+let currentStreamParams = null;  // for auto-reconnect
+let reconnectTimer = null;
+let userStopped = false;         // true = user explicitly clicked Stop
+let hasEverStreamed = false;     // true once user has started stream at least once
+let lastLogDate = null;          // track date changes for date dividers
+
+// Pod colors
+const POD_COLORS = ['#79c0ff','#a5d6ff','#d2a8ff','#ffa657','#7ee787','#ff7b72','#f0883e','#56d364'];
+const podColorMap = {};
+let podColorIdx = 0;
+
+function getPodColor(pod) {
+  if (!podColorMap[pod]) {
+    podColorMap[pod] = POD_COLORS[podColorIdx % POD_COLORS.length];
+    podColorIdx++;
+  }
+  return podColorMap[pod];
+}
+
+// Return short pod identifier: last 2 segments of pod name (the unique hash parts)
+// e.g. "user-activity-dcKPid-0day" → "dcKPid-0day"
+function shortPodName(pod) {
+  const parts = pod.split('-');
+  if (parts.length <= 3) return pod;
+  // Last 2 parts are typically the replicaset hash + pod hash
+  return parts.slice(-2).join('-');
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  updateTzDisplay();
+  loadContexts();
+  setupScrollListener();
+});
+
+// ── Session persistence ────────────────────────────────────────────────────────
+const SESSION_KEY = 'logal_session';
+
+function saveSession() {
+  const s = {
+    ctx:      document.getElementById('ctxSelect').value,
+    ns:       document.getElementById('nsSelect').value,
+    kind:     document.getElementById('kindSelect').value,
+    workload: document.getElementById('workloadInput').value,
+    filter:   document.getElementById('filterInput').value,
+    since:    document.getElementById('sinceSelect').value,
+    tail:     document.getElementById('tailSelect').value,
+  };
+  localStorage.setItem(SESSION_KEY, JSON.stringify(s));
+}
+
+function restoreSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch(e) { return null; }
+}
+
+function updateTzDisplay() {
+  document.getElementById('tzDisplay').textContent = 'UTC';
+}
+
+// ── Contexts ──────────────────────────────────────────────────────────────────
+async function loadContexts() {
+  try {
+    const res = await fetch('/api/contexts');
+    const contexts = await res.json();
+    const sel = document.getElementById('ctxSelect');
+    sel.innerHTML = contexts.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+    if (contexts.length === 0) return;
+
+    const session = restoreSession();
+
+    // Restore context
+    if (session && contexts.includes(session.ctx)) {
+      sel.value = session.ctx;
+    }
+
+    // Load namespaces, then restore rest of session
+    await onContextChange(session);
+  } catch(e) {
+    console.error('Failed to load contexts', e);
+  }
+}
+
+async function onContextChange(session = null) {
+  const ctx = document.getElementById('ctxSelect').value;
+  const sel = document.getElementById('nsSelect');
+  sel.innerHTML = '<option value="">Loading...</option>';
+  if (!session) {
+    document.getElementById('workloadInput').value = '';
+    clearSuggestions();
+  }
+  try {
+    const res = await fetch(`/api/namespaces?ctx=${enc(ctx)}`);
+    const namespaces = await res.json();
+    sel.innerHTML = '<option value="">Select namespace...</option>' +
+      namespaces.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+
+    // Restore session
+    if (session && namespaces.includes(session.ns)) {
+      sel.value = session.ns;
+      if (session.kind) document.getElementById('kindSelect').value = session.kind;
+      if (session.since) document.getElementById('sinceSelect').value = session.since;
+      if (session.tail) document.getElementById('tailSelect').value = session.tail;
+      if (session.filter) document.getElementById('filterInput').value = session.filter;
+
+      // Load workloads then restore workload + auto-start
+      await onNamespaceChange(session);
+    }
+  } catch(e) {
+    sel.innerHTML = '<option value="">Failed to load</option>';
+  }
+}
+
+// ── Namespace / Workloads ─────────────────────────────────────────────────────
+let workloadData = [];
+
+async function onNamespaceChange(session = null) {
+  const ctx = document.getElementById('ctxSelect').value;
+  const ns  = document.getElementById('nsSelect').value;
+  const kind = document.getElementById('kindSelect').value;
+  if (!ns) return;
+
+  if (!session) {
+    document.getElementById('workloadInput').value = '';
+  }
+  workloadData = [];
+
+  try {
+    const res = await fetch(`/api/workloads?ctx=${enc(ctx)}&ns=${enc(ns)}`);
+    let data = await res.json();
+    if (kind) data = data.filter(w => w.kind === kind);
+    workloadData = data;
+
+    // Restore workload + auto-start
+    if (session && session.workload) {
+      document.getElementById('workloadInput').value = session.workload;
+      await loadWorkloadInfo(session.workload);
+      // Auto-start
+      setStatus('loading', 'restoring last session...');
+      setTimeout(() => startStream(), 300);
+    }
+  } catch(e) {
+    workloadData = [];
+  }
+}
+
+// ── Autocomplete ──────────────────────────────────────────────────────────────
+let acSelected = -1;
+let acVisible = false;
+
+let workloadDebounceTimer = null;
+function onWorkloadInput() {
+  const q = document.getElementById('workloadInput').value.toLowerCase();
+  showSuggestions(q);
+
+  // Debounced auto-start: if user stops typing for 800ms and was previously streaming
+  clearTimeout(workloadDebounceTimer);
+  workloadDebounceTimer = setTimeout(() => {
+    const val = document.getElementById('workloadInput').value.trim();
+    if (val && hasEverStreamed && !userStopped) {
+      startStream();
+    }
+  }, 800);
+}
+
+function showSuggestions(q = '') {
+  const list = document.getElementById('autocompleteList');
+  const kind = document.getElementById('kindSelect').value;
+
+  let items = workloadData;
+  if (kind) items = items.filter(w => w.kind === kind);
+  if (q) items = items.filter(w => w.name.toLowerCase().includes(q));
+
+  if (items.length === 0) {
+    list.classList.remove('open');
+    return;
+  }
+
+  // Group by kind
+  const groups = {};
+  for (const item of items) {
+    if (!groups[item.kind]) groups[item.kind] = [];
+    groups[item.kind].push(item);
+  }
+
+  let html = '';
+  for (const [k, v] of Object.entries(groups)) {
+    html += `<div class="autocomplete-section">
+      <div class="autocomplete-section-label">${esc(k)}</div>
+      ${v.map(w => `<div class="autocomplete-item" onmousedown="selectWorkload('${esc(w.name)}')">${esc(w.name)}</div>`).join('')}
+    </div>`;
+  }
+
+  list.innerHTML = html;
+  list.classList.add('open');
+  acSelected = -1;
+  acVisible = true;
+}
+
+function hideSuggestionsDelayed() {
+  setTimeout(() => {
+    document.getElementById('autocompleteList').classList.remove('open');
+    acVisible = false;
+  }, 150);
+}
+
+function clearSuggestions() {
+  document.getElementById('autocompleteList').classList.remove('open');
+  acVisible = false;
+}
+
+function selectWorkload(name) {
+  document.getElementById('workloadInput').value = name;
+  clearSuggestions();
+  loadWorkloadInfo(name);
+
+  // Auto-start if user has ever streamed in this session
+  if (hasEverStreamed && !userStopped) {
+    startStream();
+  }
+}
+
+function onWorkloadKeydown(e) {
+  const list = document.getElementById('autocompleteList');
+  const items = list.querySelectorAll('.autocomplete-item');
+  if (e.key === 'ArrowDown') {
+    acSelected = Math.min(acSelected + 1, items.length - 1);
+    items.forEach((el, i) => el.classList.toggle('selected', i === acSelected));
+    e.preventDefault();
+  } else if (e.key === 'ArrowUp') {
+    acSelected = Math.max(acSelected - 1, -1);
+    items.forEach((el, i) => el.classList.toggle('selected', i === acSelected));
+    e.preventDefault();
+  } else if (e.key === 'Enter') {
+    if (acSelected >= 0 && items[acSelected]) {
+      const name = items[acSelected].textContent.trim();
+      selectWorkload(name);
+    } else {
+      startStream();
+    }
+  } else if (e.key === 'Escape') {
+    clearSuggestions();
+  }
+}
+
+// ── Workload info (pod age + history) ─────────────────────────────────────────
+async function loadWorkloadInfo(workload) {
+  if (!workload) return;
+  const ctx = document.getElementById('ctxSelect').value;
+  const ns  = document.getElementById('nsSelect').value;
+  if (!ns) return;
+
+  try {
+    const [ageRes, histRes] = await Promise.all([
+      fetch(`/api/pod-age?ctx=${enc(ctx)}&ns=${enc(ns)}&workload=${enc(workload)}`),
+      fetch(`/api/history-info?ctx=${enc(ctx)}&ns=${enc(ns)}&workload=${enc(workload)}`),
+    ]);
+    const age  = await ageRes.json();
+    const hist = await histRes.json();
+
+    const banner = document.getElementById('banner');
+    const bannerText = document.getElementById('bannerText');
+    const bannerWarn = document.getElementById('bannerWarn');
+
+    const since = document.getElementById('sinceSelect').value;
+    const sinceH = parseSinceHours(since);
+
+    bannerText.innerHTML = `Pod running sejak <b>${age.age_human}</b> · ` +
+      (hist.available
+        ? `History tersedia: <b>${hist.dates.join(', ')}</b>`
+        : `Belum ada history tersimpan — akan mulai disimpan saat di-stream`);
+
+    if (sinceH > 0 && sinceH > age.age_seconds / 3600) {
+      bannerWarn.textContent = `⚠ Time range "${since}" melebihi umur pod (${age.age_human})`;
+    } else {
+      bannerWarn.textContent = '';
+    }
+
+    banner.classList.add('show');
+  } catch(e) {
+    // ignore
+  }
+}
+
+function onSinceChange() {
+  const since = document.getElementById('sinceSelect').value;
+  const show = since === 'custom';
+  document.getElementById('dateRangeField').style.display   = show ? '' : 'none';
+  document.getElementById('dateRangeFieldTo').style.display = show ? '' : 'none';
+
+  // Set default datetime-local values to now and 1 hour ago (in local time)
+  if (show) {
+    const now = new Date();
+    const from = new Date(now - 3600000);
+    document.getElementById('dtFrom').value = toLocalDatetimeInput(from);
+    document.getElementById('dtTo').value   = toLocalDatetimeInput(now);
+    onDateRangeChange(); // update UTC hints
+  }
+
+  const w = document.getElementById('workloadInput').value.trim();
+  if (w) loadWorkloadInfo(w);
+}
+
+function toLocalDatetimeInput(d) {
+  // datetime-local needs format: YYYY-MM-DDTHH:mm in LOCAL time
+  // so the browser shows the correct local time to the user
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function updateUtcHint(inputId, hintId) {
+  const val = document.getElementById(inputId).value;
+  const hint = document.getElementById(hintId);
+  if (!val || !hint) return;
+  const d = new Date(val); // treated as local time by browser
+  if (isNaN(d)) { hint.textContent = ''; return; }
+  const pad = n => String(n).padStart(2,'0');
+  hint.textContent = `= ${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
+}
+
+function onDateRangeChange() {
+  updateUtcHint('dtFrom', 'dtFromUtcHint');
+  updateUtcHint('dtTo',   'dtToUtcHint');
+}
+
+function parseSinceHours(s) {
+  if (s === 'realtime') return 0;
+  if (s.endsWith('d')) return parseInt(s) * 24;
+  if (s.endsWith('h')) return parseInt(s);
+  if (s.endsWith('m')) return parseInt(s) / 60;
+  return 0;
+}
+
+// ── Stream ────────────────────────────────────────────────────────────────────
+async function startStream() {
+  const ctx      = document.getElementById('ctxSelect').value;
+  const ns       = document.getElementById('nsSelect').value;
+  const workload = document.getElementById('workloadInput').value.trim();
+  const filter   = document.getElementById('filterInput').value.trim();
+  const since    = document.getElementById('sinceSelect').value;
+  const tail     = document.getElementById('tailSelect').value;
+  const dtFrom   = since === 'custom' ? document.getElementById('dtFrom').value : '';
+  const dtTo     = since === 'custom' ? document.getElementById('dtTo').value : '';
+
+  if (!ns || !workload) {
+    showToast('Please select namespace and workload');
+    return;
+  }
+  if (since === 'custom' && !dtFrom) {
+    showToast('Please set a From datetime for custom range');
+    return;
+  }
+
+  // Load pods + containers first
+  await loadPodsForStream(ctx, ns, workload);
+
+  const params = { ctx, ns, workload, filter, since, tail, dtFrom, dtTo };
+
+  // Check volume warning
+  const podCount = document.querySelectorAll('#podChips .selector-chip.checked').length;
+  const containerCount = document.querySelectorAll('#containerChips .selector-chip.checked').length;
+  const est = podCount * containerCount * 60; // rough lines/min
+
+  if (est > 500) {
+    pendingStreamParams = params;
+    document.getElementById('warningText').innerHTML =
+      `Estimasi: <b>${podCount} pod</b> × <b>${containerCount} container</b> ≈ <b>${est}+ baris/menit</b>.<br><br>` +
+      `Browser bisa berat. Saran: tambah filter grep atau kurangi pod/container yang dipilih.`;
+    document.getElementById('warningOverlay').classList.add('show');
+    return;
+  }
+
+  doStartStream(params);
+}
+
+function dismissWarning() {
+  document.getElementById('warningOverlay').classList.remove('show');
+  pendingStreamParams = null;
+}
+
+function proceedStream() {
+  document.getElementById('warningOverlay').classList.remove('show');
+  if (pendingStreamParams) {
+    doStartStream(pendingStreamParams);
+    pendingStreamParams = null;
+  }
+}
+
+function doStartStream(p, skipPodFilter = false) {
+  stopStream();
+  clearLogs();
+  saveSession();
+  currentStreamParams = p;
+  userStopped = false;
+  hasEverStreamed = true;
+
+  const checkedContainers = [...document.querySelectorAll('#containerChips .selector-chip.checked')]
+    .map(el => el.dataset.name).join(',');
+
+  // On reconnect (skipPodFilter=true), don't send pod names — let stern
+  // discover new pods by workload pattern after a restart.
+  let checkedPods = '';
+  if (!skipPodFilter) {
+    checkedPods = [...document.querySelectorAll('#podChips .selector-chip.checked')]
+      .map(el => el.dataset.name).join(',');
+  }
+
+  let url = `/api/logs?ctx=${enc(p.ctx)}&ns=${enc(p.ns)}&workload=${enc(p.workload)}`;
+  if (p.filter)   url += `&filter=${enc(p.filter)}`;
+  if (p.since !== 'custom' && p.since) url += `&since=${enc(p.since)}`;
+  if (p.tail)     url += `&tail=${enc(p.tail)}`;
+  // dtFrom/dtTo are local time — new Date() treats datetime-local as local, toISOString() converts to UTC
+  if (p.dtFrom)   url += `&from=${enc(new Date(p.dtFrom).toISOString())}`;
+  if (p.dtTo)     url += `&to=${enc(new Date(p.dtTo).toISOString())}`;
+  if (checkedPods) url += `&pods=${enc(checkedPods)}`;
+  if (checkedContainers) url += `&containers=${enc(checkedContainers)}`;
+
+  setStatus('loading', 'connecting...');
+  document.getElementById('emptyState').style.display = 'none';
+
+  eventSource = new EventSource(url);
+
+  eventSource.onopen = () => {
+    setStatus('active', 'streaming');
+    document.getElementById('startBtn').disabled = true;
+    document.getElementById('stopBtn').disabled = false;
+  };
+
+  eventSource.onmessage = (e) => {
+    const line = e.data
+      .replace(/\\n/g, '\n')
+      .replace(/\\t/g, '\t');
+    appendLogLine(line);
+  };
+
+  eventSource.onerror = () => {
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+    if (userStopped || !currentStreamParams) {
+      setStatus('idle', 'disconnected');
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('stopBtn').disabled = true;
+      return;
+    }
+    // Auto-reconnect after 3s (pod restart, network blip, etc.)
+    const disconnectTime = new Date().toLocaleTimeString('id-ID', { hour12: false, timeZone: 'Asia/Jakarta' });
+    setStatus('loading', 'reconnecting...');
+    showToast(`⚠ Stream terputus — kemungkinan pod restart. Reconnecting...`, 5000);
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(async () => {
+      if (!userStopped && currentStreamParams) {
+        appendLogLine(`__RESTART__${disconnectTime}`);
+        // Re-fetch pod list to discover new pods after restart
+        const p = currentStreamParams;
+        await loadPodsForStream(p.ctx, p.ns, p.workload);
+        // Use since=1m so we don't replay old history — only get fresh logs
+        doStartStream({ ...p, since: '1m' }, true);
+      }
+    }, 3000);
+  };
+}
+
+function stopStream(manual = false) {
+  if (manual) {
+    userStopped = true;
+    clearTimeout(reconnectTimer);
+    currentStreamParams = null;
+  }
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+  setStatus('idle', 'idle');
+  document.getElementById('startBtn').disabled = false;
+  document.getElementById('stopBtn').disabled = true;
+}
+
+// ── Pod/Container loader ──────────────────────────────────────────────────────
+async function loadPodsForStream(ctx, ns, workload) {
+  const kind = document.getElementById('kindSelect').value;
+  try {
+    const res = await fetch(`/api/pods?ctx=${enc(ctx)}&ns=${enc(ns)}&workload=${enc(workload)}&kind=${enc(kind)}`);
+    const pods = await res.json();
+
+    if (!pods || pods.length === 0) {
+      document.getElementById('selectors').classList.remove('show');
+      return;
+    }
+
+    // Build pod chips — default: check only first 5 pods if list is large
+    const tooMany = pods.length > 10;
+    const podChips = document.getElementById('podChips');
+    podChips.innerHTML = pods.map((p, i) =>
+      `<span class="selector-chip ${tooMany && i >= 5 ? '' : 'checked'}" data-name="${esc(p.name)}" onclick="toggleChip(this)"
+        style="--pod-c:${getPodColor(p.name)}">
+        <span class="chip-dot" style="background:${getPodColor(p.name)}"></span>
+        ${esc(p.name)}
+      </span>`
+    ).join('');
+    if (tooMany) {
+      podChips.insertAdjacentHTML('afterbegin',
+        `<div style="width:100%;color:var(--warn);font-size:11px;margin-bottom:4px">
+          ⚠ ${pods.length} pods ditemukan — hanya 5 pertama dipilih otomatis. Pilih manual pod yang diinginkan.
+        </div>`);
+    }
+
+    // Collect unique containers across all pods
+    const containerMap = {};
+    for (const pod of pods) {
+      (pod.containers || []).forEach((c, i) => {
+        if (!containerMap[c]) {
+          const sidecar = Array.isArray(pod.is_sidecar) ? !!pod.is_sidecar[i] : false;
+          containerMap[c] = { name: c, isSidecar: sidecar };
+        }
+      });
+    }
+
+    const containerChips = document.getElementById('containerChips');
+    const containerList = Object.values(containerMap);
+    if (containerList.length > 0) {
+      // Single-select: only check the first non-sidecar container by default
+      let firstChecked = false;
+      containerChips.innerHTML = containerList.map(c => {
+        const check = !c.isSidecar && !firstChecked ? (firstChecked = true, true) : false;
+        return `<span class="selector-chip ${check ? 'checked' : ''} ${c.isSidecar ? 'sidecar' : ''}"
+          data-name="${esc(c.name)}" onclick="toggleChip(this)">
+          <span class="chip-dot"></span>
+          ${esc(c.name)}${c.isSidecar ? ' <span style="color:var(--text-dimmer);font-size:10px">(sidecar)</span>' : ''}
+        </span>`;
+      }).join('');
+    }
+
+    document.getElementById('selectors').classList.add('show');
+  } catch(e) {
+    document.getElementById('selectors').classList.remove('show');
+  }
+}
+
+function toggleChip(el) {
+  // Pods: multi-select (toggle)
+  // Containers: single-select (radio behavior)
+  const isContainer = el.closest('#containerChips') !== null;
+  if (isContainer) {
+    // Radio: uncheck all others, check this one
+    document.querySelectorAll('#containerChips .selector-chip').forEach(c => c.classList.remove('checked'));
+    el.classList.add('checked');
+  } else {
+    el.classList.toggle('checked');
+  }
+
+  // Restart stream when chip is toggled, regardless of whether stream is active.
+  // (eventSource may be null after loadTerminatedContainerLogs stopped it)
+  const wasStreaming = !!eventSource || !!currentStreamParams;
+  if (!wasStreaming) return;
+
+  const ctx      = document.getElementById('ctxSelect').value;
+  const ns       = document.getElementById('nsSelect').value;
+  const workload = document.getElementById('workloadInput').value.trim();
+  const filter   = document.getElementById('filterInput').value.trim();
+  const since    = document.getElementById('sinceSelect').value;
+  const tail     = document.getElementById('tailSelect').value;
+  if (!ns || !workload) return;
+
+  // If selected container is a sidecar/init, show its static logs
+  if (isContainer && el.classList.contains('sidecar')) {
+    const container = el.dataset.name;
+    const pod = document.querySelector('#podChips .selector-chip.checked')?.dataset.name;
+    if (pod) {
+      clearLogContent();
+      loadTerminatedContainerLogs(ctx, ns, pod, container);
+      return;
+    }
+  }
+
+  // Normal container selected — restart live stream
+  clearLogContent();
+  doStartStream({ ctx, ns, workload, filter, since, tail });
+}
+
+async function loadTerminatedContainerLogs(ctx, ns, pod, container) {
+  stopStream();
+  setStatus('loading', 'loading terminated container logs...');
+  clearLogContent();
+
+  try {
+    const url = `/api/container-logs?ctx=${enc(ctx)}&ns=${enc(ns)}&pod=${enc(pod)}&container=${enc(container)}&init=true`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('failed to fetch logs');
+    const data = await res.json();
+
+    setStatus('idle', `${data.total} lines (terminated container)`);
+
+    if (data.lines.length === 0) {
+      appendLogLine(`[no logs found for ${container} in ${pod}]`);
+      return;
+    }
+
+    // Render lines — format: "2026-06-19T... actual log"
+    for (const line of data.lines) {
+      appendLogLine(`${new Date().toISOString()} [${pod}][${container}] ${line}`);
+    }
+  } catch(e) {
+    setStatus('idle', 'error loading container logs');
+    appendLogLine(`[error: ${e.message}]`);
+  }
+}
+
+function toggleAllPods(on) {
+  document.querySelectorAll('#podChips .selector-chip').forEach(el => {
+    el.classList.toggle('checked', on);
+  });
+}
+
+// ── Log rendering ─────────────────────────────────────────────────────────────
+function appendLogLine(raw) {
+  const content = document.getElementById('logContent');
+  const emptyState = document.getElementById('emptyState');
+  if (emptyState) emptyState.style.display = 'none';
+
+  // Check if it's the history→realtime divider signal
+  if (raw === '__END__') {
+    document.getElementById('startBtn').disabled = false;
+    document.getElementById('stopBtn').disabled = true;
+    eventSource && eventSource.close();
+    eventSource = null;
+
+    if (lineCount === 0) {
+      // No data found for the selected range
+      setStatus('idle', 'no data found');
+      const content = document.getElementById('logContent');
+      const msg = document.createElement('div');
+      msg.className = 'empty-state';
+      msg.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:8px;padding:60px 20px;color:var(--text-dimmer);';
+      const since = document.getElementById('sinceSelect').value;
+      const dtFrom = document.getElementById('dtFrom')?.value;
+      const dtTo   = document.getElementById('dtTo')?.value;
+      const rangeInfo = since === 'custom' && dtFrom
+        ? `<span style="color:var(--text-dim);font-size:12px">${dtFrom} → ${dtTo || 'now'} UTC</span>`
+        : `<span style="color:var(--text-dim);font-size:12px">Range: ${since}</span>`;
+      msg.innerHTML = `
+        <span style="font-size:28px;opacity:.3">⚠</span>
+        <span style="font-size:13px;font-weight:600;color:var(--text)">Tidak ada log ditemukan</span>
+        ${rangeInfo}
+        <span style="font-size:11px;margin-top:4px">History hanya tersimpan sejak log pertama kali di-stream.<br>Coba pilih range waktu yang berbeda.</span>`;
+      content.appendChild(msg);
+    } else {
+      setStatus('idle', `done · ${lineCount} lines`);
+    }
+    return;
+  }
+
+  if (raw === '__DIVIDER__') {
+    const div = document.createElement('div');
+    div.className = 'history-divider';
+    div.innerHTML = '<span class="divider-line"></span><span>── live ──</span><span class="divider-line"></span>';
+    content.appendChild(div);
+    scrollIfNeeded();
+    return;
+  }
+
+  // Pod restart divider
+  if (raw.startsWith('__RESTART__')) {
+    const atTime = raw.replace('__RESTART__', '');
+    const div = document.createElement('div');
+    div.className = 'restart-divider';
+    div.innerHTML = `<span class="divider-line"></span><span>⚠ stream terputus pukul ${atTime} — pod restart · log di atas dari pod lama · reconnecting ke pod baru...</span><span class="divider-line"></span>`;
+    content.appendChild(div);
+    scrollIfNeeded();
+    return;
+  }
+
+  // Parse: "2026-06-19T10:00:01Z [pod-name][container] message"
+  const match = raw.match(/^(\S+)\s+\[([^\]]*)\]\[([^\]]*)\]\s+([\s\S]*)$/);
+
+  const el = document.createElement('div');
+  el.className = 'log-line';
+
+  let ts = '', pod = '', container = '', msg = raw;
+
+  if (match) {
+    ts        = match[1];
+    pod       = match[2];
+    container = match[3];
+    msg       = match[4];
+  }
+
+  // Detect log level
+  const msgLower = msg.toLowerCase();
+  let level = '';
+  let badge = '';
+  if (/\b(error|err|fatal|exception|panic)\b/.test(msgLower)) {
+    level = 'level-error';
+    badge = '<span class="log-level-badge badge-error">ERR</span>';
+  } else if (/\b(warn|warning)\b/.test(msgLower)) {
+    level = 'level-warn';
+    badge = '<span class="log-level-badge badge-warn">WRN</span>';
+  } else if (/\b(info)\b/.test(msgLower)) {
+    level = 'level-info';
+    badge = '<span class="log-level-badge badge-info">INF</span>';
+  }
+
+  if (level) el.classList.add(level);
+
+  // Format timestamp: UTC time + date + days ago
+  let tsHtml = '';
+  if (ts) {
+    try {
+      const d = new Date(ts);
+      const hh = String(d.getUTCHours()).padStart(2, '0');
+      const mm = String(d.getUTCMinutes()).padStart(2, '0');
+      const ss = String(d.getUTCSeconds()).padStart(2, '0');
+      const timeStr = `${hh}:${mm}:${ss}`;
+
+      // days ago label
+      const now = new Date();
+      const diffMs = now - d;
+      const diffDays = Math.floor(diffMs / 86400000);
+      let agoStr;
+      if (diffDays === 0)      agoStr = 'today';
+      else if (diffDays === 1) agoStr = 'yesterday';
+      else                     agoStr = `${diffDays}d ago`;
+
+      // short date: Jun 19
+      const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      const dateStr = `${months[d.getUTCMonth()]} ${d.getUTCDate()}`;
+
+      // Date divider when date changes
+      const dateKey = `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
+      if (dateKey !== lastLogDate) {
+        lastLogDate = dateKey;
+        const label = diffDays === 0 ? `Today · ${dateStr}` :
+                      diffDays === 1 ? `Yesterday · ${dateStr}` :
+                      `${diffDays} days ago · ${dateStr}`;
+        const datDiv = document.createElement('div');
+        datDiv.className = 'date-divider';
+        datDiv.innerHTML = `<span class="divider-line"></span><span>${label} (UTC)</span><span class="divider-line"></span>`;
+        content.appendChild(datDiv);
+      }
+
+      tsHtml = `<span class="log-ts"><span class="ts-time">${esc(timeStr)}</span></span>`;
+    } catch(e) {
+      tsHtml = `<span class="log-ts"><span class="ts-time">${esc(ts)}</span></span>`;
+    }
+  }
+
+  const podColor = pod ? getPodColor(pod) : 'var(--text-dim)';
+
+  el.innerHTML =
+    (ts ? tsHtml : '') +
+    (pod ? `<span class="log-pod" style="color:${podColor}" title="${esc(pod)}">[${esc(shortPodName(pod))}]</span>` : '') +
+    (container ? `<span class="log-container">[${esc(container)}]</span>` : '') +
+    badge +
+    `<span class="log-msg">${escHtml(msg)}</span>`;
+
+  content.appendChild(el);
+
+  lineCount++;
+  document.getElementById('lineCount').textContent = lineCount.toLocaleString() + ' lines';
+
+  // Keep allLogs for copy/download
+  allLogs.push(raw);
+
+  // Trim DOM if too many lines (virtual scroll lite)
+  if (content.children.length > 8000) {
+    for (let i = 0; i < 1000; i++) {
+      if (content.firstChild) content.removeChild(content.firstChild);
+    }
+  }
+
+  scrollIfNeeded();
+}
+
+function clearLogContent() {
+  // Light clear: reset log lines but keep pod color map consistent
+  const content = document.getElementById('logContent');
+  content.innerHTML = '';
+  lineCount = 0;
+  allLogs = [];
+  lastLogDate = null;
+  document.getElementById('lineCount').textContent = '0 lines';
+}
+
+function clearLogs() {
+  const content = document.getElementById('logContent');
+  content.innerHTML = '';
+  lineCount = 0;
+  allLogs = [];
+  lastLogDate = null;
+  Object.keys(podColorMap).forEach(k => delete podColorMap[k]);
+  podColorIdx = 0;
+  document.getElementById('lineCount').textContent = '0 lines';
+  document.getElementById('emptyState') && (document.getElementById('emptyState').style.display = '');
+
+  // Re-add empty state
+  const empty = document.createElement('div');
+  empty.className = 'empty-state';
+  empty.id = 'emptyState';
+  empty.innerHTML = `
+    <div class="empty-logo"><span class="b">[</span> Loga<span style="display:inline-block;transform:scaleX(-1)">L</span> <span class="b">]</span></div>
+    <div class="empty-hint">Select a workload and press Start</div>`;
+  content.appendChild(empty);
+}
+
+// ── Auto scroll ───────────────────────────────────────────────────────────────
+function setupScrollListener() {
+  const outer = document.getElementById('logOuter');
+  const btn = document.getElementById('scrollBottomBtn');
+
+  outer.addEventListener('scroll', () => {
+    const atBottom = outer.scrollHeight - outer.scrollTop - outer.clientHeight < 60;
+    if (!atBottom && autoScroll) {
+      autoScroll = false;
+      updateAutoScrollBtn();
+    }
+    btn.classList.toggle('show', !atBottom);
+  });
+}
+
+function scrollIfNeeded() {
+  if (!autoScroll) return;
+  const outer = document.getElementById('logOuter');
+  outer.scrollTop = outer.scrollHeight;
+}
+
+function scrollToBottom() {
+  const outer = document.getElementById('logOuter');
+  outer.scrollTop = outer.scrollHeight;
+  autoScroll = true;
+  updateAutoScrollBtn();
+  document.getElementById('scrollBottomBtn').classList.remove('show');
+}
+
+function toggleAutoScroll() {
+  autoScroll = !autoScroll;
+  updateAutoScrollBtn();
+  if (autoScroll) scrollToBottom();
+}
+
+function updateAutoScrollBtn() {
+  const btn = document.getElementById('autoscrollBtn');
+  btn.classList.toggle('on', autoScroll);
+  btn.textContent = autoScroll ? '↓ auto-scroll' : '↓ auto-scroll';
+}
+
+// ── Copy / Download ───────────────────────────────────────────────────────────
+function copyLogs() {
+  const text = allLogs.join('\n');
+  navigator.clipboard.writeText(text).then(() => showToast('Copied to clipboard!'));
+}
+
+function downloadLogs() {
+  const workload = document.getElementById('workloadInput').value.trim() || 'logs';
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = `${workload}-${ts}.log`;
+  const blob = new Blob([allLogs.join('\n')], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  showToast('Downloading ' + filename);
+}
+
+// ── Status ────────────────────────────────────────────────────────────────────
+function setStatus(state, text) {
+  const dot = document.getElementById('statusDot');
+  const txt = document.getElementById('statusText');
+  dot.className = 'status-dot ' + state;
+  txt.textContent = text;
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+let toastTimer = null;
+function showToast(msg, duration = 2500) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), duration);
+}
+
+// ── Utils ─────────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function enc(s) { return encodeURIComponent(s || ''); }
+</script>
+</body>
+</html>
