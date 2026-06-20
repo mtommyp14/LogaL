@@ -79,7 +79,7 @@ spec:
 
       containers:
       - name: logal
-        image: your-registry/logal:latest  # ganti dengan image kamu
+        image: mtommyp14/logal:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8080

@@ -63,28 +63,56 @@ kubectl apply -f deployment.yaml
 
 ## 🏗️ Architecture
 
+```mermaid
+graph LR
+    A[Browser] -->|HTTP / SSE| B(LogaL Server)
+    B -->|kubectl logs --follow| C[Kubernetes Cluster]
+    B -->|INSERT / SELECT| D[(PostgreSQL)]
+    D -->|history stream| B
+    B -->|SSE| A
 ```
-Developer (Browser)
-       │ HTTP / SSE
-       ▼
-┌─────────────────────────────────────────┐
-│             LogaL Pod                   │
-│         (namespace: logging)            │
-│                                         │
-│  ┌──────────┐   ┌─────────────┐   ┌────────┐ │
-│  │Go Server │──▶│ kubectl logs│   │   DB   │ │
-│  │REST + SSE│   │ per pod     │   │PostgreSQL
-│  │Static UI │   │ per container│   │        │ │
-│  └──────────┘   └─────────────┘   └────────┘ │
-│        │            │             ▲      │
-│        │        Log Router       │      │
-│        │         ├── SSE ───────┼─────┼──▶ Browser
-│        │         └── Write ─────┘      │
-└────────┼────────────────────────────────┘
-         │ kubectl
-    ┌────┴────┬──────────┐
-    ▼         ▼          ▼
-Cluster A  Cluster B  Cluster C
+
+### Real-time mode
+
+```mermaid
+sequenceDiagram
+    participant U as Browser
+    participant L as LogaL Server
+    participant K as Kubernetes API
+    participant D as PostgreSQL
+
+    U->>L: GET /api/logs?workload=...
+    par history
+        L->>D: SELECT logs since ...
+        D->>L: rows
+        L->>U: SSE data lines
+    and live
+        loop every 3s
+            L->>K: list pods by selector
+            K->>L: pod list
+        end
+        loop per pod/container
+            L->>K: kubectl logs --follow
+            K->>L: log lines
+            L->>D: INSERT log
+            L->>U: SSE data line
+        end
+    end
+```
+
+### Custom range mode
+
+```mermaid
+sequenceDiagram
+    participant U as Browser
+    participant L as LogaL Server
+    participant D as PostgreSQL
+
+    U->>L: GET /api/logs?from=...&to=...
+    L->>D: SELECT logs BETWEEN ...
+    D->>L: rows
+    L->>U: SSE data lines
+    L->>U: __END__
 ```
 
 ### Flow
@@ -321,28 +349,56 @@ kubectl apply -f deployment.yaml
 
 ## 🏗️ Arsitektur
 
+```mermaid
+graph LR
+    A[Browser] -->|HTTP / SSE| B(LogaL Server)
+    B -->|kubectl logs --follow| C[Cluster Kubernetes]
+    B -->|INSERT / SELECT| D[(PostgreSQL)]
+    D -->|stream history| B
+    B -->|SSE| A
 ```
-Developer (Browser)
-       │ HTTP / SSE
-       ▼
-┌─────────────────────────────────────────┐
-│             LogaL Pod                   │
-│         (namespace: logging)            │
-│                                         │
-│  ┌──────────┐   ┌─────────────┐   ┌────────┐ │
-│  │Go Server │──▶│ kubectl logs│   │   DB   │ │
-│  │REST + SSE│   │ per pod     │   │PostgreSQL
-│  │Static UI │   │ per container│   │        │ │
-│  └──────────┘   └─────────────┘   └────────┘ │
-│        │            │             ▲      │
-│        │        Log Router       │      │
-│        │         ├── SSE ───────┼─────┼──▶ Browser
-│        │         └── Write ─────┘      │
-└────────┼────────────────────────────────┘
-         │ kubectl
-    ┌────┴────┬──────────┐
-    ▼         ▼          ▼
-Cluster A  Cluster B  Cluster C
+
+### Mode real-time
+
+```mermaid
+sequenceDiagram
+    participant U as Browser
+    participant L as LogaL Server
+    participant K as Kubernetes API
+    participant D as PostgreSQL
+
+    U->>L: GET /api/logs?workload=...
+    par history
+        L->>D: SELECT log sejak ...
+        D->>L: baris
+        L->>U: SSE data lines
+    and live
+        loop setiap 3 detik
+            L->>K: list pods berdasarkan selector
+            K->>L: daftar pod
+        end
+        loop per pod/container
+            L->>K: kubectl logs --follow
+            K->>L: baris log
+            L->>D: INSERT log
+            L->>U: SSE data line
+        end
+    end
+```
+
+### Mode custom range
+
+```mermaid
+sequenceDiagram
+    participant U as Browser
+    participant L as LogaL Server
+    participant D as PostgreSQL
+
+    U->>L: GET /api/logs?from=...&to=...
+    L->>D: SELECT log ANTARA ...
+    D->>L: baris
+    L->>U: SSE data lines
+    L->>U: __END__
 ```
 
 ### Alur Kerja
