@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -534,6 +533,270 @@ func cleanOldLogs() {
 	}
 }
 
+// ── Kubernetes log streaming via kubectl ────────────────────────────────────
+
+// podContainer holds a pod name and its container names.
+type podContainer struct {
+	Name       string
+	Containers []string
+	IsSidecar  []bool
+}
+
+// listWorkloadPods lists pods for a workload using the same label selector logic as handlePods.
+func listWorkloadPods(ctxName, ns, workload, kind string) []podContainer {
+	var labelSelector string
+	{
+		resType := strings.ToLower(kind)
+		if resType == "" {
+			resType = "deployment"
+		}
+		args := []string{"get", resType, workload, "-n", ns,
+			"-o", "jsonpath={.spec.selector.matchLabels}"}
+		if ctxName != "" && ctxName != "in-cluster" {
+			args = append([]string{"--context", ctxName}, args...)
+		}
+		out, err := kubectl(context.Background(), args...)
+		if err == nil {
+			var labels map[string]string
+			if json.Unmarshal(out, &labels) == nil {
+				var parts []string
+				for k, v := range labels {
+					parts = append(parts, k+"="+v)
+				}
+				labelSelector = strings.Join(parts, ",")
+			}
+		}
+	}
+
+	args := []string{"get", "pods", "-n", ns,
+		"-o", `jsonpath={range .items[*]}{.metadata.name}{"\t"}{range .spec.containers[*]}{.name}{" "}{end}{"\t"}{range .spec.initContainers[*]}{.name}{" "}{end}{"\n"}{end}`}
+	if labelSelector != "" {
+		args = append(args, "-l", labelSelector)
+	} else {
+		args = append(args, "--field-selector", "metadata.name="+workload)
+	}
+	if ctxName != "" && ctxName != "in-cluster" {
+		args = append([]string{"--context", ctxName}, args...)
+	}
+
+	out, err := kubectl(context.Background(), args...)
+	if err != nil {
+		log.Printf("[list pods] error: %v", err)
+		return nil
+	}
+
+	var result []podContainer
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) < 2 {
+			continue
+		}
+		pc := podContainer{Name: parts[0]}
+		for _, c := range strings.Fields(parts[1]) {
+			pc.Containers = append(pc.Containers, c)
+			pc.IsSidecar = append(pc.IsSidecar, isSidecarContainer(c))
+		}
+		if len(parts) >= 3 {
+			for _, c := range strings.Fields(parts[2]) {
+				pc.Containers = append(pc.Containers, c)
+				pc.IsSidecar = append(pc.IsSidecar, true)
+			}
+		}
+		result = append(result, pc)
+	}
+	return result
+}
+
+// parseKubectlLogLine parses a kubectl logs --timestamps line.
+func parseKubectlLogLine(raw, pod, container string) LogLine {
+	l := LogLine{
+		Pod:       pod,
+		Container: container,
+		Ts:        time.Now().UTC(),
+	}
+	raw = strings.TrimRight(raw, "\n")
+	// kubectl logs --timestamps format: "2006-01-02T15:04:05.123456789Z message"
+	if idx := strings.IndexByte(raw, ' '); idx > 0 {
+		if t, err := time.Parse(time.RFC3339Nano, raw[:idx]); err == nil {
+			l.Ts = t.UTC()
+			raw = raw[idx+1:]
+		} else if t, err := time.Parse(time.RFC3339, raw[:idx]); err == nil {
+			l.Ts = t.UTC()
+			raw = raw[idx+1:]
+		}
+	}
+	l.Message = raw
+	msgLower := strings.ToLower(raw)
+	switch {
+	case strings.Contains(msgLower, "error"), strings.Contains(msgLower, "err"):
+		l.Level = "ERROR"
+	case strings.Contains(msgLower, "warn"), strings.Contains(msgLower, "warning"):
+		l.Level = "WARN"
+	case strings.Contains(msgLower, "info"):
+		l.Level = "INFO"
+	case strings.Contains(msgLower, "debug"):
+		l.Level = "DEBUG"
+	}
+	return l
+}
+
+// streamContainerLogs follows logs for one container using kubectl logs --follow.
+// It reconnects automatically when the stream ends or fails.
+func streamContainerLogs(ctx context.Context, ctxName, ns, workload, pod, container string, sinceTime *time.Time, filter string, logCh chan<- string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		args := []string{"logs", pod, "-n", ns, "-c", container, "--timestamps=true", "--follow"}
+		if ctxName != "" && ctxName != "in-cluster" {
+			args = append([]string{"--context", ctxName}, args...)
+		}
+		if kubeconfig != "" {
+			args = append(args, "--kubeconfig", kubeconfig)
+		}
+		if sinceTime != nil {
+			args = append(args, "--since-time", sinceTime.UTC().Format(time.RFC3339))
+		} else {
+			args = append(args, "--tail=100")
+		}
+
+		cmd := exec.CommandContext(ctx, "kubectl", args...)
+		cmd.Env = os.Environ()
+		if kubeconfig != "" {
+			cmd.Env = append(cmd.Env, "KUBECONFIG="+kubeconfig)
+		}
+
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			log.Printf("[kubectl logs] stdout pipe error %s/%s: %v", pod, container, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		stderr, _ := cmd.StderrPipe()
+
+		if err := cmd.Start(); err != nil {
+			log.Printf("[kubectl logs] start error %s/%s: %v", pod, container, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		log.Printf("[kubectl logs] started %s/%s", pod, container)
+
+		go func() {
+			scanner := bufio.NewScanner(stderr)
+			for scanner.Scan() {
+				log.Printf("[kubectl logs stderr %s/%s] %s", pod, container, scanner.Text())
+			}
+		}()
+
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
+		for scanner.Scan() {
+			select {
+			case <-ctx.Done():
+				if cmd.Process != nil {
+					cmd.Process.Kill()
+				}
+				return
+			default:
+			}
+			raw := scanner.Text()
+			l := parseKubectlLogLine(raw, pod, container)
+			if filter != "" && !strings.Contains(strings.ToLower(l.Message), strings.ToLower(filter)) {
+				continue
+			}
+			l.Cluster = ctxName
+			l.Namespace = ns
+			l.Workload = workload
+			if err := insertLogLine(ctx, l); err != nil {
+				log.Printf("[db] insert error: %v", err)
+			}
+			select {
+			case logCh <- formatLogLine(l):
+			case <-ctx.Done():
+				if cmd.Process != nil {
+					cmd.Process.Kill()
+				}
+				return
+			}
+		}
+		scannerErr := scanner.Err()
+		_ = cmd.Wait()
+		log.Printf("[kubectl logs] scanner done %s/%s: %v", pod, container, scannerErr)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// streamWorkloadLogsKubectl polls pods for a workload and follows logs for each container.
+func streamWorkloadLogsKubectl(ctx context.Context, ctxName, ns, workload, kind, requestedPods, requestedContainers string, sinceTime *time.Time, filter string, logCh chan<- string) {
+	requestedPodSet := map[string]bool{}
+	if requestedPods != "" {
+		for _, p := range strings.Split(requestedPods, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				requestedPodSet[p] = true
+			}
+		}
+	}
+	requestedContainerSet := map[string]bool{}
+	if requestedContainers != "" {
+		for _, c := range strings.Split(requestedContainers, ",") {
+			if c = strings.TrimSpace(c); c != "" {
+				requestedContainerSet[c] = true
+			}
+		}
+	}
+
+	active := map[string]bool{}
+	var mu sync.Mutex
+
+	for {
+		podList := listWorkloadPods(ctxName, ns, workload, kind)
+		for _, pc := range podList {
+			if len(requestedPodSet) > 0 && !requestedPodSet[pc.Name] {
+				continue
+			}
+			for i, c := range pc.Containers {
+				if len(requestedContainerSet) > 0 && !requestedContainerSet[c] {
+					continue
+				}
+				if len(requestedContainerSet) == 0 && pc.IsSidecar[i] {
+					continue
+				}
+				key := pc.Name + "/" + c
+				mu.Lock()
+				if active[key] {
+					mu.Unlock()
+					continue
+				}
+				active[key] = true
+				mu.Unlock()
+
+				go func(pod, container string) {
+					streamContainerLogs(ctx, ctxName, ns, workload, pod, container, sinceTime, filter, logCh)
+					mu.Lock()
+					delete(active, key)
+					mu.Unlock()
+				}(pc.Name, c)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
+	}
+}
+
 // ── SSE log streaming ─────────────────────────────────────────────────────────
 
 func handleLogs(w http.ResponseWriter, r *http.Request) {
@@ -605,7 +868,7 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 	// Stream history from flat files first
 	if sinceTime != nil {
 		if isCustomRange && toTime != nil {
-			// Custom range: stream history (with exact time bounds) then send __END__, no stern
+			// Custom range: stream history (with exact time bounds) then send __END__, no live streaming
 			go func() {
 				streamHistoryFiles(ctx, ctxName, ns, workload, *sinceTime, toTime, filter, logCh)
 				// Safely send end sentinel (ctx may already be done)
@@ -621,135 +884,13 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	// Build stern command for real-time
+	// Stream real-time logs via kubectl logs --follow
 	go func() {
 		// Small delay if we're also streaming history, to let it start first
 		if sinceTime != nil {
 			time.Sleep(100 * time.Millisecond)
 		}
-
-		// Build pod pattern: workload name as prefix regex (matches all pods in deployment)
-		// If specific pods selected, use exact pod names as regex OR pattern
-		podPattern := workload
-		if pods != "" {
-			podList := []string{}
-			for _, pod := range strings.Split(pods, ",") {
-				pod = strings.TrimSpace(pod)
-				if pod != "" {
-					podList = append(podList, regexp.QuoteMeta(pod))
-				}
-			}
-			if len(podList) > 0 {
-				podPattern = strings.Join(podList, "|")
-			}
-		}
-
-		args := []string{podPattern, "--namespace", ns, "--output", "json", "--timestamps=default"}
-
-		if ctxName != "" && ctxName != "in-cluster" {
-			args = append(args, "--context", ctxName)
-		}
-		if kubeconfig != "" {
-			args = append(args, "--kubeconfig", kubeconfig)
-		}
-		if filter != "" {
-			args = append(args, "--grep", filter)
-		}
-
-		// Don't pass --since or --tail: stern default is --since=48h which keeps
-		// it alive streaming live logs after printing recent history.
-		// Only pass --since if user picked a specific time range, converting
-		// "Nd" days format to hours since stern doesn't support "d" unit.
-		if sinceStr != "" && sinceStr != "realtime" {
-			sternSince := toSternDuration(sinceStr)
-			if sternSince != "" {
-				args = append(args, "--since", sternSince)
-			}
-		}
-
-		// Filter specific containers
-		if containers != "" {
-			containerList := []string{}
-			for _, c := range strings.Split(containers, ",") {
-				c = strings.TrimSpace(c)
-				if c != "" {
-					containerList = append(containerList, regexp.QuoteMeta(c))
-				}
-			}
-			if len(containerList) > 0 {
-				args = append(args, "--container", strings.Join(containerList, "|"))
-			}
-		}
-
-		cmd := exec.CommandContext(ctx, "stern", args...)
-		// Always inherit full environment; add/override KUBECONFIG if specified
-		cmd.Env = os.Environ()
-		if kubeconfig != "" {
-			cmd.Env = append(cmd.Env, "KUBECONFIG="+kubeconfig)
-		}
-
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			logCh <- `{"error":"failed to start stern: ` + err.Error() + `"}`
-			return
-		}
-		stderr, _ := cmd.StderrPipe()
-		// Log stern stderr so we can see errors
-		go func() {
-			scanner := bufio.NewScanner(stderr)
-			for scanner.Scan() {
-				log.Printf("[stern stderr] %s", scanner.Text())
-			}
-		}()
-
-		if err := cmd.Start(); err != nil {
-			logCh <- `{"error":"failed to start stern: ` + err.Error() + `"}`
-			return
-		}
-
-		log.Printf("[stern] started: %v", args)
-
-		// Ensure stern is killed when context is cancelled (client disconnect)
-		go func() {
-			<-ctx.Done()
-			if cmd.Process != nil {
-				log.Printf("[stern] killing pid %d", cmd.Process.Pid)
-				cmd.Process.Kill()
-			}
-		}()
-
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-		for scanner.Scan() {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			line := scanner.Text()
-			// Skip non-JSON lines (e.g. stern info lines like "+ pod › container")
-			if len(line) == 0 || line[0] != '{' {
-				log.Printf("[stern] skip non-json: %s", line)
-				continue
-			}
-			var sl SternLine
-			if err := json.Unmarshal([]byte(line), &sl); err != nil {
-				log.Printf("[stern] parse error: %v | line: %s", err, line)
-				continue
-			}
-			log.Printf("[stern] got line: pod=%s container=%s", sl.PodName, sl.ContainerName)
-			logLine := formatParsedSternLine(sl)
-			if logLine.Message != "" || logLine.Pod != "" {
-				logLine.Cluster = ctxName
-				logLine.Namespace = ns
-				logLine.Workload = workload
-				if err := insertLogLine(ctx, logLine); err != nil {
-					log.Printf("[db] insert error: %v", err)
-				}
-				logCh <- formatLogLine(logLine)
-			}
-		}
-		log.Printf("[stern] scanner done: %v", scanner.Err())
+		streamWorkloadLogsKubectl(ctx, ctxName, ns, workload, q.Get("kind"), pods, containers, sinceTime, filter, logCh)
 	}()
 
 	// Send SSE to browser
@@ -772,64 +913,6 @@ streamLoop:
 			flusher.Flush()
 		}
 	}
-}
-
-// ── Stern JSON parser ─────────────────────────────────────────────────────────
-
-type SternLine struct {
-	Message       string `json:"message"`
-	NodeName      string `json:"nodeName"`
-	Namespace     string `json:"namespace"`
-	PodName       string `json:"podName"`
-	ContainerName string `json:"containerName"`
-	Timestamp     string `json:"timestamp"`
-}
-
-func formatSternLine(raw string) string {
-	var sl SternLine
-	if err := json.Unmarshal([]byte(raw), &sl); err != nil {
-		return ""
-	}
-	l := formatParsedSternLine(sl)
-	return formatLogLine(l)
-}
-
-func formatParsedSternLine(sl SternLine) LogLine {
-	// Stern --timestamps puts timestamp inside the message field itself
-	// message format: "2026-06-19T13:00:56Z actual log message"
-	// We extract it and use podName/containerName from JSON fields
-	msg := strings.TrimRight(sl.Message, "\n")
-	l := LogLine{
-		Pod:       sl.PodName,
-		Container: sl.ContainerName,
-	}
-
-	// Extract leading timestamp from message if present
-	if parts := strings.SplitN(msg, " ", 2); len(parts) == 2 {
-		if t, err := time.Parse(time.RFC3339Nano, parts[0]); err == nil {
-			l.Ts = t.UTC()
-			msg = parts[1]
-		}
-	}
-	if l.Ts.IsZero() {
-		l.Ts = time.Now().UTC()
-	}
-
-	l.Message = msg
-
-	// Detect log level from message prefix if present
-	msgLower := strings.ToLower(msg)
-	switch {
-	case strings.Contains(msgLower, "error"), strings.Contains(msgLower, "err"):
-		l.Level = "ERROR"
-	case strings.Contains(msgLower, "warn"), strings.Contains(msgLower, "warning"):
-		l.Level = "WARN"
-	case strings.Contains(msgLower, "info"):
-		l.Level = "INFO"
-	case strings.Contains(msgLower, "debug"):
-		l.Level = "DEBUG"
-	}
-	return l
 }
 
 // ── API: history files list ───────────────────────────────────────────────────
@@ -867,23 +950,6 @@ func handleHistoryInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-// toSternDuration converts a since string to a format stern understands.
-// stern only supports Go duration units (s, m, h) — not "d" for days.
-func toSternDuration(s string) string {
-	s = strings.TrimSpace(strings.ToLower(s))
-	if strings.HasSuffix(s, "d") {
-		n, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
-		if err == nil {
-			return fmt.Sprintf("%dh", n*24)
-		}
-	}
-	// already valid Go duration (e.g. "1h", "30m")
-	if _, err := time.ParseDuration(s); err == nil {
-		return s
-	}
-	return ""
-}
 
 func parseSince(s string) time.Duration {
 	s = strings.TrimSpace(strings.ToLower(s))

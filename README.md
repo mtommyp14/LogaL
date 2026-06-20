@@ -10,7 +10,7 @@
 
 **Dark-themed web UI for tailing Kubernetes pod logs in real-time with history support.**
 
-Powered by [`stern`](https://github.com/stern/stern) on the backend, a single Go binary, and PostgreSQL storage. Multi-replica ready.
+Powered by `kubectl logs` on the backend, a single Go binary, and PostgreSQL storage. Multi-replica ready.
 
 ---
 
@@ -48,7 +48,7 @@ kubectl apply -f deployment.yaml
 ## ✨ Features
 
 - **Dark theme** UI optimized for long log sessions.
-- **Real-time streaming** via Server-Sent Events (`stern`).
+- **Real-time streaming** via Server-Sent Events (`kubectl logs`).
 - **History** stored in PostgreSQL with automatic cleanup (default 3 days).
 - **Custom time range** picker with live UTC hints and per-row filtering.
 - **Multi-pod / multi-container** selector, smart sidecar OFF by default.
@@ -71,17 +71,17 @@ Developer (Browser)
 │             LogaL Pod                   │
 │         (namespace: logging)            │
 │                                         │
-│  ┌──────────┐   ┌────────┐   ┌────────┐ │
-│  │Go Server │──▶│ Stern  │   │   DB   │ │
-│  │REST + SSE│   │(child  │   │PostgreSQL
-│  │Static UI │   │process)│   │        │ │
-│  └──────────┘   └────────┘   └────────┘ │
+│  ┌──────────┐   ┌─────────────┐   ┌────────┐ │
+│  │Go Server │──▶│ kubectl logs│   │   DB   │ │
+│  │REST + SSE│   │ per pod     │   │PostgreSQL
+│  │Static UI │   │ per container│   │        │ │
+│  └──────────┘   └─────────────┘   └────────┘ │
 │        │            │             ▲      │
 │        │        Log Router       │      │
 │        │         ├── SSE ───────┼─────┼──▶ Browser
 │        │         └── Write ─────┘      │
 └────────┼────────────────────────────────┘
-         │ kubectl / stern
+         │ kubectl
     ┌────┴────┬──────────┐
     ▼         ▼          ▼
 Cluster A  Cluster B  Cluster C
@@ -94,14 +94,14 @@ User selects workload + time range
          ↓
 LogaL checks:
   History in PostgreSQL? → query DB → stream to browser (history)
-  Stern runs in parallel → new logs keep coming (real-time)
+  kubectl logs runs in parallel → new logs keep coming (real-time)
          ↓
 Browser displays:
   - Scroll up   = history logs
   - Scroll down = latest real-time logs
 
 Custom range mode:
-  → queries PostgreSQL history only (no stern)
+  → queries PostgreSQL history only (no live streaming)
   → filters each row by from/to timestamp (UTC)
   → sends __END__ signal when done
 ```
@@ -112,7 +112,7 @@ Custom range mode:
 
 - Kubernetes cluster (1.25+) or local `kubectl` access
 - PostgreSQL 13+
-- `kubectl` and `stern` installed locally (for `start.sh`)
+- `kubectl` installed locally (for `start.sh`)
 - Go 1.22+ (for building from source)
 
 ---
@@ -268,7 +268,7 @@ This project is licensed under the [MIT License](LICENSE).
 
 **Web UI bertema gelap untuk melihat log Kubernetes pods secara real-time beserta riwayat log.**
 
-Menggunakan [`stern`](https://github.com/stern/stern) di backend, binary Go tunggal, dan penyimpanan PostgreSQL. Siap multi-replica, tidak perlu pengetahuan database untuk menjalankannya.
+Menggunakan `kubectl logs` di backend, binary Go tunggal, dan penyimpanan PostgreSQL. Siap multi-replica, tidak perlu pengetahuan database untuk menjalankannya.
 
 ---
 
@@ -306,7 +306,7 @@ kubectl apply -f deployment.yaml
 ## ✨ Fitur
 
 - **Dark theme** UI yang nyaman untuk sesi log panjang.
-- **Streaming real-time** via Server-Sent Events (`stern`).
+- **Streaming real-time** via Server-Sent Events (`kubectl logs`).
 - **History** tersimpan di PostgreSQL dengan auto-cleanup (default 3 hari).
 - **Custom time range** picker dengan hint UTC live dan filter per baris.
 - **Multi-pod / multi-container** selector, sidecar OFF secara default.
@@ -329,17 +329,17 @@ Developer (Browser)
 │             LogaL Pod                   │
 │         (namespace: logging)            │
 │                                         │
-│  ┌──────────┐   ┌────────┐   ┌────────┐ │
-│  │Go Server │──▶│ Stern  │   │   DB   │ │
-│  │REST + SSE│   │(child  │   │PostgreSQL
-│  │Static UI │   │process)│   │        │ │
-│  └──────────┘   └────────┘   └────────┘ │
+│  ┌──────────┐   ┌─────────────┐   ┌────────┐ │
+│  │Go Server │──▶│ kubectl logs│   │   DB   │ │
+│  │REST + SSE│   │ per pod     │   │PostgreSQL
+│  │Static UI │   │ per container│   │        │ │
+│  └──────────┘   └─────────────┘   └────────┘ │
 │        │            │             ▲      │
 │        │        Log Router       │      │
 │        │         ├── SSE ───────┼─────┼──▶ Browser
 │        │         └── Write ─────┘      │
 └────────┼────────────────────────────────┘
-         │ kubectl / stern
+         │ kubectl
     ┌────┴────┬──────────┐
     ▼         ▼          ▼
 Cluster A  Cluster B  Cluster C
@@ -352,14 +352,14 @@ User pilih workload + time range
          ↓
 LogaL cek:
   Ada history di PostgreSQL? → query DB → stream ke browser (history)
-  Stern berjalan paralel → log baru terus masuk (real-time)
+  kubectl logs berjalan paralel → log baru terus masuk (real-time)
          ↓
 Browser tampilkan:
   - Scroll ke atas   = log history
   - Scroll ke bawah  = log real-time terbaru
 
 Mode custom range:
-  → hanya query history PostgreSQL (stern tidak dijalankan)
+  → hanya query history PostgreSQL (tidak ada live streaming)
   → filter setiap baris berdasarkan from/to timestamp (UTC)
   → kirim sinyal __END__ saat selesai
 ```
@@ -370,7 +370,7 @@ Mode custom range:
 
 - Cluster Kubernetes (1.25+) atau akses `kubectl` lokal
 - PostgreSQL 13+
-- `kubectl` dan `stern` terinstall secara lokal (untuk `start.sh`)
+- `kubectl` terinstall secara lokal (untuk `start.sh`)
 - Go 1.22+ (untuk build dari source)
 
 ---

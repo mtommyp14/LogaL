@@ -1,6 +1,6 @@
 #!/bin/bash
 # LogaL — Quick local run script
-# Requires: Go, stern, kubectl, and PostgreSQL installed locally
+# Requires: Go, kubectl, and PostgreSQL installed locally
 
 set -e
 
@@ -26,7 +26,6 @@ check_cmd() {
 
 echo "Checking dependencies..."
 check_cmd go
-check_cmd stern
 check_cmd kubectl
 echo ""
 

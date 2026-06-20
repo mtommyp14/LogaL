@@ -1242,8 +1242,8 @@ function doStartStream(p, skipPodFilter = false) {
   const checkedContainers = [...document.querySelectorAll('#containerChips .selector-chip.checked')]
     .map(el => el.dataset.name).join(',');
 
-  // On reconnect (skipPodFilter=true), don't send pod names — let stern
-  // discover new pods by workload pattern after a restart.
+  // On reconnect (skipPodFilter=true), don't send pod names — let the server
+  // discover new pods by workload selector after a restart.
   let checkedPods = '';
   if (!skipPodFilter) {
     checkedPods = [...document.querySelectorAll('#podChips .selector-chip.checked')]
