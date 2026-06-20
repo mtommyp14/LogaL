@@ -67,6 +67,11 @@ metadata:
     app: logal
 spec:
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: logal
@@ -88,13 +93,17 @@ spec:
         env:
         - name: PORT
           value: "8080"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         - name: DATABASE_URL
           valueFrom:
             secretKeyRef:
               name: logal-db
               key: url
         - name: LOG_RETENTION_DAYS
-          value: "3"
+          value: "7"
         # Uncomment untuk multi-cluster:
         # - name: KUBECONFIG
         #   value: "/kubeconfig/config"
@@ -110,11 +119,11 @@ spec:
 
         resources:
           requests:
-            cpu: 100m
-            memory: 128Mi
+            cpu: 200m
+            memory: 256Mi
           limits:
-            cpu: 500m
-            memory: 512Mi
+            cpu: 1000m
+            memory: 1Gi
 
         readinessProbe:
           httpGet:

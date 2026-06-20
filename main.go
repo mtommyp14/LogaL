@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -31,9 +33,13 @@ var (
 	databaseURL       = getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/logal")
 	retentionDays     = getEnvInt("LOG_RETENTION_DAYS", 3)
 	allowedNamespaces = getEnv("ALLOWED_NAMESPACES", "")
+	podName           = getEnv("POD_NAME", "logal-local") // used for leader election
 )
 
 var dbPool *pgxpool.Pool
+
+// isLeader tracks whether this pod currently holds the cluster-wide collector lock.
+var isLeader atomic.Bool
 
 func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -458,6 +464,13 @@ func initDB(ctx context.Context) (*pgxpool.Pool, error) {
 		CREATE INDEX IF NOT EXISTS idx_logs_lookup ON logs(cluster, namespace, workload, ts);
 		CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
 		CREATE INDEX IF NOT EXISTS idx_logs_message ON logs USING gin(to_tsvector('english', message));
+
+		CREATE TABLE IF NOT EXISTS leader_lock (
+			lock_id      INT PRIMARY KEY,
+			holder       TEXT NOT NULL,
+			acquired_at  TIMESTAMPTZ NOT NULL,
+			expires_at   TIMESTAMPTZ NOT NULL
+		);
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("create schema: %w", err)
@@ -511,6 +524,379 @@ func streamHistoryFiles(ctx context.Context, cluster, ns, workload string, since
 		}
 		out <- formatLogLine(l)
 	}
+}
+
+// ── Leader election ───────────────────────────────────────────────────────────
+
+const leaderLockID = 424242
+
+// tryAcquireLeader tries to become the active collector pod using a DB-backed lease.
+// Returns true if this pod successfully acquired or renewed the lease.
+func tryAcquireLeader(ctx context.Context) (bool, error) {
+	leaseDuration := 15 * time.Second
+
+	res, err := dbPool.Exec(ctx, `
+		INSERT INTO leader_lock (lock_id, holder, acquired_at, expires_at)
+		VALUES ($1, $2, now(), now() + $3::interval)
+		ON CONFLICT (lock_id) DO UPDATE
+		SET holder = EXCLUDED.holder,
+		    acquired_at = EXCLUDED.acquired_at,
+		    expires_at = EXCLUDED.expires_at
+		WHERE leader_lock.expires_at < now()
+		   OR leader_lock.holder = $2
+	`, leaderLockID, podName, fmt.Sprintf("%f seconds", leaseDuration.Seconds()))
+	if err != nil {
+		return false, err
+	}
+	return res.RowsAffected() > 0, nil
+}
+
+// releaseLeader voluntarily gives up the leader lease.
+func releaseLeader(ctx context.Context) {
+	_, _ = dbPool.Exec(ctx, `
+		DELETE FROM leader_lock WHERE lock_id = $1 AND holder = $2
+	`, leaderLockID, podName)
+}
+
+// runLeaderElection keeps trying to acquire/renew the leader lease.
+// When this pod becomes leader, it starts the global log collector.
+// When it loses leadership, it stops the collector.
+func runLeaderElection(ctx context.Context) {
+	const tick = 5 * time.Second
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	var collectorCancel context.CancelFunc
+
+	for {
+		acquired, err := tryAcquireLeader(ctx)
+		if err != nil {
+			log.Printf("[leader] acquire error: %v", err)
+			isLeader.Store(false)
+		} else if acquired {
+			if !isLeader.Load() {
+				log.Printf("[leader] %s became leader", podName)
+				isLeader.Store(true)
+				cctx, cancel := context.WithCancel(ctx)
+				collectorCancel = cancel
+				go runLogCollector(cctx)
+			}
+		} else {
+			if isLeader.Load() {
+				log.Printf("[leader] %s lost leadership", podName)
+				isLeader.Store(false)
+				if collectorCancel != nil {
+					collectorCancel()
+					collectorCancel = nil
+				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			if isLeader.Load() {
+				isLeader.Store(false)
+				releaseLeader(ctx)
+				if collectorCancel != nil {
+					collectorCancel()
+				}
+			}
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// ── Global log collector ────────────────────────────────────────────────────
+
+// podKey uniquely identifies a pod in the cluster.
+type podKey struct {
+	Namespace string
+	Name      string
+}
+
+// containerKey uniquely identifies a container inside a pod.
+type containerKey struct {
+	podKey
+	Container string
+}
+
+// podContainerState holds the cancel function for a running container stream.
+type collectorState struct {
+	mu       sync.Mutex
+	streams  map[containerKey]context.CancelFunc
+	podNames map[podKey]bool
+}
+
+// runLogCollector is the leader-only background loop that watches all pods
+// and streams every container's logs into PostgreSQL.
+func runLogCollector(ctx context.Context) {
+	state := &collectorState{
+		streams:  make(map[containerKey]context.CancelFunc),
+		podNames: make(map[podKey]bool),
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			state.stopAll()
+			return
+		default:
+		}
+		log.Printf("[collector] starting pod watcher")
+		watchPods(ctx, state)
+		log.Printf("[collector] pod watcher ended, retrying in 5s")
+		select {
+		case <-ctx.Done():
+			state.stopAll()
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// watchPods runs `kubectl get pods --all-namespaces --watch` and keeps log
+// streams alive for every running pod/container.
+func watchPods(ctx context.Context, state *collectorState) {
+	args := []string{"get", "pods", "--all-namespaces", "--watch", "-o", "json"}
+	if kubeconfig != "" {
+		args = append(args, "--kubeconfig", kubeconfig)
+	}
+
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
+	cmd.Env = os.Environ()
+	if kubeconfig != "" {
+		cmd.Env = append(cmd.Env, "KUBECONFIG="+kubeconfig)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("[collector] stdout pipe error: %v", err)
+		return
+	}
+	stderr, _ := cmd.StderrPipe()
+
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			log.Printf("[collector stderr] %s", scanner.Text())
+		}
+	}()
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("[collector] start error: %v", err)
+		return
+	}
+	defer func() {
+		_ = cmd.Wait()
+	}()
+
+	decoder := json.NewDecoder(stdout)
+	for {
+		select {
+		case <-ctx.Done():
+			if cmd.Process != nil {
+				cmd.Process.Kill()
+			}
+			return
+		default:
+		}
+
+		var event podWatchEvent
+		if err := decoder.Decode(&event); err != nil {
+			if err == io.EOF {
+				return
+			}
+			log.Printf("[collector] decode error: %v", err)
+			return
+		}
+		state.handlePodEvent(ctx, event)
+	}
+}
+
+// podWatchEvent mirrors the fields we need from a kubectl watch event.
+type podWatchEvent struct {
+	Type   string `json:"type"`
+	Object struct {
+		APIVersion string `json:"apiVersion"`
+		Kind       string `json:"kind"`
+		Metadata   struct {
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+		} `json:"metadata"`
+		Spec struct {
+			Containers     []struct {
+				Name string `json:"name"`
+			} `json:"containers"`
+			InitContainers []struct {
+				Name string `json:"name"`
+			} `json:"initContainers"`
+		} `json:"spec"`
+		Status struct {
+			Phase string `json:"phase"`
+		} `json:"status"`
+	} `json:"object"`
+}
+
+func (s *collectorState) handlePodEvent(ctx context.Context, e podWatchEvent) {
+	ns := e.Object.Metadata.Namespace
+	pod := e.Object.Metadata.Name
+	phase := e.Object.Status.Phase
+	key := podKey{Namespace: ns, Name: pod}
+
+	// Ignore pods that are not yet running or already terminating.
+	if phase != "Running" && phase != "Pending" {
+		// For delete events, stop immediately.
+		if e.Type == "DELETED" {
+			s.stopPod(key)
+		}
+		return
+	}
+
+	if e.Type == "DELETED" {
+		s.stopPod(key)
+		return
+	}
+
+	// Collect regular + init containers.
+	var containers []string
+	for _, c := range e.Object.Spec.Containers {
+		containers = append(containers, c.Name)
+	}
+	for _, c := range e.Object.Spec.InitContainers {
+		containers = append(containers, c.Name)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.podNames[key] = true
+
+	for _, c := range containers {
+		ck := containerKey{podKey: key, Container: c}
+		if _, ok := s.streams[ck]; ok {
+			continue
+		}
+		cctx, cancel := context.WithCancel(ctx)
+		s.streams[ck] = cancel
+		go streamContainerLogsForCollector(cctx, ns, pod, c)
+		log.Printf("[collector] started %s/%s/%s", ns, pod, c)
+	}
+}
+
+func (s *collectorState) stopPod(key podKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.podNames, key)
+	for ck, cancel := range s.streams {
+		if ck.podKey == key {
+			cancel()
+			delete(s.streams, ck)
+			log.Printf("[collector] stopped %s/%s/%s", ck.Namespace, ck.Name, ck.Container)
+		}
+	}
+}
+
+func (s *collectorState) stopAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, cancel := range s.streams {
+		cancel()
+	}
+	s.streams = make(map[containerKey]context.CancelFunc)
+	s.podNames = make(map[podKey]bool)
+	log.Printf("[collector] stopped all streams")
+}
+
+// streamContainerLogsForCollector follows a single container's logs and writes
+// every line to PostgreSQL. It runs for the lifetime of the pod.
+func streamContainerLogsForCollector(ctx context.Context, ns, pod, container string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		args := []string{"logs", pod, "-n", ns, "-c", container, "--timestamps=true", "--follow", "--tail=100"}
+		if kubeconfig != "" {
+			args = append(args, "--kubeconfig", kubeconfig)
+		}
+
+		cmd := exec.CommandContext(ctx, "kubectl", args...)
+		cmd.Env = os.Environ()
+		if kubeconfig != "" {
+			cmd.Env = append(cmd.Env, "KUBECONFIG="+kubeconfig)
+		}
+
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			log.Printf("[collector] stdout pipe error %s/%s/%s: %v", ns, pod, container, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+		stderr, _ := cmd.StderrPipe()
+
+		if err := cmd.Start(); err != nil {
+			log.Printf("[collector] start error %s/%s/%s: %v", ns, pod, container, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+
+		go func() {
+			scanner := bufio.NewScanner(stderr)
+			for scanner.Scan() {
+				log.Printf("[collector stderr %s/%s/%s] %s", ns, pod, container, scanner.Text())
+			}
+		}()
+
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
+		for scanner.Scan() {
+			select {
+			case <-ctx.Done():
+				if cmd.Process != nil {
+					cmd.Process.Kill()
+				}
+				return
+			default:
+			}
+			raw := scanner.Text()
+			l := parseKubectlLogLine(raw, pod, container)
+			l.Cluster = "in-cluster"
+			if kubeconfig != "" {
+				l.Cluster = "kubeconfig"
+			}
+			l.Namespace = ns
+			l.Workload = podWorkloadKey(ns, pod)
+			if err := insertLogLine(ctx, l); err != nil {
+				log.Printf("[db] insert error: %v", err)
+			}
+		}
+		scannerErr := scanner.Err()
+		_ = cmd.Wait()
+		log.Printf("[collector] scanner done %s/%s/%s: %v", ns, pod, container, scannerErr)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// podWorkloadKey returns a stable grouping key for the collector.
+// We don't know the parent workload name cheaply, so we group by namespace/pod
+// for the global collector and expose it as the workload field.
+func podWorkloadKey(ns, pod string) string {
+	return ns + "/" + pod
 }
 
 // ── Cleanup goroutine ─────────────────────────────────────────────────────────
@@ -976,6 +1362,14 @@ func jsonResp(w http.ResponseWriter, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// ── API: config ───────────────────────────────────────────────────────────────
+
+func handleConfig(w http.ResponseWriter, r *http.Request) {
+	jsonResp(w, map[string]interface{}{
+		"retentionDays": retentionDays,
+	})
+}
+
 // ── API: container logs (for terminated/init containers) ──────────────────────
 
 func handleContainerLogs(w http.ResponseWriter, r *http.Request) {
@@ -1041,6 +1435,9 @@ func main() {
 	// Start cleanup goroutine
 	startCleanup()
 
+	// Start leader election / global log collector
+	go runLeaderElection(ctx)
+
 	mux := http.NewServeMux()
 
 	// UI
@@ -1058,6 +1455,7 @@ func main() {
 	mux.HandleFunc("/api/logs", handleLogs)
 	mux.HandleFunc("/api/history-info", handleHistoryInfo)
 	mux.HandleFunc("/api/container-logs", handleContainerLogs)
+	mux.HandleFunc("/api/config", handleConfig)
 
 	log.Printf("LogaL starting on :%s", port)
 	log.Printf("Database: %s (retention: %d days)", databaseURL, retentionDays)

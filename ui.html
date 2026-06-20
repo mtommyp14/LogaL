@@ -721,14 +721,7 @@
       <div class="field">
         <label>Time Range</label>
         <select id="sinceSelect" onchange="onSinceChange()">
-          <option value="realtime">Real-time</option>
-          <option value="30m">Last 30 minutes</option>
-          <option value="1h">Last 1 hour</option>
-          <option value="6h">Last 6 hours</option>
-          <option value="1d">Last 1 day</option>
-          <option value="2d">Last 2 days</option>
-          <option value="3d">Last 3 days (max)</option>
-          <option value="custom">Custom range...</option>
+          <!-- options populated from /api/config retention -->
         </select>
       </div>
 
@@ -869,11 +862,66 @@ function shortPodName(pod) {
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
+let appConfig = { retentionDays: 3 };
+
+document.addEventListener('DOMContentLoaded', async () => {
   updateTzDisplay();
+  await loadConfig();
   loadContexts();
   setupScrollListener();
 });
+
+async function loadConfig() {
+  try {
+    const res = await fetch('/api/config');
+    appConfig = await res.json();
+  } catch (e) {
+    console.warn('failed to load config', e);
+  }
+  buildSinceSelect();
+}
+
+function buildSinceSelect() {
+  const retention = appConfig.retentionDays || 3;
+  const sel = document.getElementById('sinceSelect');
+  const options = [
+    { value: 'realtime', label: 'Real-time' }
+  ];
+  const presets = [
+    { m: 30, label: '30 minutes' },
+    { h: 1, label: '1 hour' },
+    { h: 6, label: '6 hours' },
+    { d: 1, label: '1 day' },
+    { d: 2, label: '2 days' },
+    { d: 3, label: '3 days' }
+  ];
+  for (const p of presets) {
+    let value, label, days;
+    if (p.m) {
+      value = `${p.m}m`;
+      label = `Last ${p.label}`;
+      days = p.m / 1440;
+    } else if (p.h) {
+      value = `${p.h}h`;
+      label = `Last ${p.label}`;
+      days = p.h / 24;
+    } else {
+      value = `${p.d}d`;
+      label = `Last ${p.label}`;
+      days = p.d;
+    }
+    if (days <= retention) {
+      options.push({ value, label });
+    }
+  }
+  // mark the longest available option as max
+  if (options.length > 1) {
+    const last = options[options.length - 1];
+    last.label += ' (max)';
+  }
+  options.push({ value: 'custom', label: 'Custom range...' });
+  sel.innerHTML = options.map(o => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join('');
+}
 
 // ── Session persistence ────────────────────────────────────────────────────────
 const SESSION_KEY = 'logal_session';
