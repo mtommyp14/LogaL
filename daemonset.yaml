@@ -1,27 +1,26 @@
 # LogaL — All-in-one Kubernetes manifest
-# Includes: Namespace, RBAC, Deployment, Service
+# Includes: Namespace, RBAC, DaemonSet, Service
 #
 # What it does:
-#   - Deploys 2 replicas of LogaL in the `logging` namespace.
-#   - One pod becomes the leader via PostgreSQL lease and auto-collects logs
-#     from every pod/container in every namespace.
-#   - The second pod stays on standby and takes over if the leader fails.
+#   - Deploys one LogaL pod on every node via a DaemonSet.
+#   - Each pod collects logs only from pods running on the same node.
+#   - Stores all logs in a central PostgreSQL database.
 #   - Exposes the UI/API on port 8080 through a ClusterIP Service.
 #
 # Requirements:
 #   - PostgreSQL database reachable from the cluster.
 #   - Create the logal-db secret before applying this manifest.
 #
-# Quick deploy (single cluster):
+# Quick deploy:
 #   kubectl create secret generic logal-db \
 #     --from-literal=url="postgres://user:pass@host:5432/logal" -n logging
-#   kubectl apply -f deployment.yaml
+#   kubectl apply -f daemonset.yaml
 #
 # Multi-cluster (optional):
 #   kubectl create secret generic logal-kubeconfig \
 #     --from-file=config=./merged-kubeconfig -n logging
-#   # then uncomment the KUBECONFIG env and kubeconfig volume in the Deployment
-#   kubectl apply -f deployment.yaml
+#   # then uncomment the KUBECONFIG env and kubeconfig volume below
+#   kubectl apply -f daemonset.yaml
 
 ---
 apiVersion: v1
@@ -67,23 +66,17 @@ subjects:
   namespace: logging
 
 ---
-# ── Deployment ────────────────────────────────────────────────────────────────
+# ── DaemonSet ─────────────────────────────────────────────────────────────────
+# One LogaL pod per node. Each pod only watches pods scheduled on the same node,
+# so the load is distributed across the cluster.
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: logal
   namespace: logging
   labels:
     app: logal
 spec:
-  # Run 2 replicas for high availability. Only the leader collects logs;
-  # the standby replica takes over automatically during rolling updates.
-  replicas: 2
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
   selector:
     matchLabels:
       app: logal
@@ -106,11 +99,11 @@ spec:
         # Web server port
         - name: PORT
           value: "8080"
-        # Unique pod name used by leader election (downward API)
-        - name: POD_NAME
+        # Node name used to filter pods for node-local collection
+        - name: NODE_NAME
           valueFrom:
             fieldRef:
-              fieldPath: metadata.name
+              fieldPath: spec.nodeName
         # PostgreSQL connection string (required)
         - name: DATABASE_URL
           valueFrom:
@@ -135,8 +128,8 @@ spec:
         #   mountPath: /kubeconfig
         #   readOnly: true
 
-        # Resource limits are intentionally generous because the leader pod
-        # runs many concurrent kubectl log streams in large clusters.
+        # Resource limits are intentionally generous because the pod runs
+        # many concurrent kubectl log streams for the node.
         resources:
           requests:
             cpu: 200m
@@ -184,15 +177,15 @@ spec:
   type: ClusterIP
 
 ---
-# ── Ingress (optional, uncomment dan sesuaikan) ───────────────────────────────
+# ── Ingress (optional, uncomment and adjust) ──────────────────────────────────
 # apiVersion: networking.k8s.io/v1
 # kind: Ingress
 # metadata:
 #   name: logal
 #   namespace: logging
 #   annotations:
-#     nginx.ingress.kubernetes.io/proxy-buffering: "off"      # penting untuk SSE
-#     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"  # penting untuk SSE
+#     nginx.ingress.kubernetes.io/proxy-buffering: "off"      # required for SSE
+#     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"  # required for SSE
 # spec:
 #   ingressClassName: nginx
 #   rules:
