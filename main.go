@@ -643,6 +643,8 @@ func runLogCollector(ctx context.Context) {
 			return
 		default:
 		}
+		log.Printf("[collector] syncing existing pods")
+		syncExistingPods(ctx, state)
 		log.Printf("[collector] starting pod watcher")
 		watchPods(ctx, state)
 		log.Printf("[collector] pod watcher ended, retrying in 5s")
@@ -653,6 +655,56 @@ func runLogCollector(ctx context.Context) {
 		case <-time.After(5 * time.Second):
 		}
 	}
+}
+
+// syncExistingPods lists all currently running pods and starts log streams
+// for every container. This is needed because kubectl --watch only emits
+// events for changes after the watch starts.
+func syncExistingPods(ctx context.Context, state *collectorState) {
+	args := []string{"get", "pods", "--all-namespaces", "-o", "json"}
+	if kubeconfig != "" {
+		args = append(args, "--kubeconfig", kubeconfig)
+	}
+
+	out, err := kubectl(ctx, args...)
+	if err != nil {
+		log.Printf("[collector] list existing pods error: %v", err)
+		return
+	}
+
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name      string `json:"name"`
+				Namespace string `json:"namespace"`
+			} `json:"metadata"`
+			Spec struct {
+				Containers     []struct {
+					Name string `json:"name"`
+				} `json:"containers"`
+				InitContainers []struct {
+					Name string `json:"name"`
+				} `json:"initContainers"`
+			} `json:"spec"`
+			Status struct {
+				Phase string `json:"phase"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(out, &list); err != nil {
+		log.Printf("[collector] unmarshal existing pods error: %v", err)
+		return
+	}
+
+	for _, item := range list.Items {
+		event := podWatchEvent{Type: "ADDED"}
+		event.Object.Metadata = item.Metadata
+		event.Object.Spec.Containers = item.Spec.Containers
+		event.Object.Spec.InitContainers = item.Spec.InitContainers
+		event.Object.Status.Phase = item.Status.Phase
+		state.handlePodEvent(ctx, event)
+	}
+	log.Printf("[collector] synced %d existing pods", len(list.Items))
 }
 
 // watchPods runs `kubectl get pods --all-namespaces --watch` and keeps log
