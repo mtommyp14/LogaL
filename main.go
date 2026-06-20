@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -33,13 +32,10 @@ var (
 	databaseURL       = getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/logal")
 	retentionDays     = getEnvInt("LOG_RETENTION_DAYS", 3)
 	allowedNamespaces = getEnv("ALLOWED_NAMESPACES", "")
-	podName           = getEnv("POD_NAME", "logal-local") // used for leader election
+	nodeName          = getEnv("NODE_NAME", "") // empty = watch all nodes (Deployment mode)
 )
 
 var dbPool *pgxpool.Pool
-
-// isLeader tracks whether this pod currently holds the cluster-wide collector lock.
-var isLeader atomic.Bool
 
 func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -464,13 +460,6 @@ func initDB(ctx context.Context) (*pgxpool.Pool, error) {
 		CREATE INDEX IF NOT EXISTS idx_logs_lookup ON logs(cluster, namespace, workload, ts);
 		CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
 		CREATE INDEX IF NOT EXISTS idx_logs_message ON logs USING gin(to_tsvector('english', message));
-
-		CREATE TABLE IF NOT EXISTS leader_lock (
-			lock_id      INT PRIMARY KEY,
-			holder       TEXT NOT NULL,
-			acquired_at  TIMESTAMPTZ NOT NULL,
-			expires_at   TIMESTAMPTZ NOT NULL
-		);
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("create schema: %w", err)
@@ -526,87 +515,6 @@ func streamHistoryFiles(ctx context.Context, cluster, ns, workload string, since
 	}
 }
 
-// ── Leader election ───────────────────────────────────────────────────────────
-
-const leaderLockID = 424242
-
-// tryAcquireLeader tries to become the active collector pod using a DB-backed lease.
-// Returns true if this pod successfully acquired or renewed the lease.
-func tryAcquireLeader(ctx context.Context) (bool, error) {
-	leaseDuration := 15 * time.Second
-
-	res, err := dbPool.Exec(ctx, `
-		INSERT INTO leader_lock (lock_id, holder, acquired_at, expires_at)
-		VALUES ($1, $2, now(), now() + $3::interval)
-		ON CONFLICT (lock_id) DO UPDATE
-		SET holder = EXCLUDED.holder,
-		    acquired_at = EXCLUDED.acquired_at,
-		    expires_at = EXCLUDED.expires_at
-		WHERE leader_lock.expires_at < now()
-		   OR leader_lock.holder = $2
-	`, leaderLockID, podName, fmt.Sprintf("%f seconds", leaseDuration.Seconds()))
-	if err != nil {
-		return false, err
-	}
-	return res.RowsAffected() > 0, nil
-}
-
-// releaseLeader voluntarily gives up the leader lease.
-func releaseLeader(ctx context.Context) {
-	_, _ = dbPool.Exec(ctx, `
-		DELETE FROM leader_lock WHERE lock_id = $1 AND holder = $2
-	`, leaderLockID, podName)
-}
-
-// runLeaderElection keeps trying to acquire/renew the leader lease.
-// When this pod becomes leader, it starts the global log collector.
-// When it loses leadership, it stops the collector.
-func runLeaderElection(ctx context.Context) {
-	const tick = 5 * time.Second
-	ticker := time.NewTicker(tick)
-	defer ticker.Stop()
-
-	var collectorCancel context.CancelFunc
-
-	for {
-		acquired, err := tryAcquireLeader(ctx)
-		if err != nil {
-			log.Printf("[leader] acquire error: %v", err)
-			isLeader.Store(false)
-		} else if acquired {
-			if !isLeader.Load() {
-				log.Printf("[leader] %s became leader", podName)
-				isLeader.Store(true)
-				cctx, cancel := context.WithCancel(ctx)
-				collectorCancel = cancel
-				go runLogCollector(cctx)
-			}
-		} else {
-			if isLeader.Load() {
-				log.Printf("[leader] %s lost leadership", podName)
-				isLeader.Store(false)
-				if collectorCancel != nil {
-					collectorCancel()
-					collectorCancel = nil
-				}
-			}
-		}
-
-		select {
-		case <-ctx.Done():
-			if isLeader.Load() {
-				isLeader.Store(false)
-				releaseLeader(ctx)
-				if collectorCancel != nil {
-					collectorCancel()
-				}
-			}
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
 // ── Global log collector ────────────────────────────────────────────────────
 
 // podKey uniquely identifies a pod in the cluster.
@@ -657,11 +565,14 @@ func runLogCollector(ctx context.Context) {
 	}
 }
 
-// syncExistingPods lists all currently running pods and starts log streams
-// for every container. This is needed because kubectl --watch only emits
-// events for changes after the watch starts.
+// syncExistingPods lists all currently running pods on this node and starts
+// log streams for every container. This is needed because kubectl --watch only
+// emits events for changes after the watch starts.
 func syncExistingPods(ctx context.Context, state *collectorState) {
 	args := []string{"get", "pods", "--all-namespaces", "-o", "json"}
+	if nodeName != "" {
+		args = append(args, "--field-selector", "spec.nodeName="+nodeName)
+	}
 	if kubeconfig != "" {
 		args = append(args, "--kubeconfig", kubeconfig)
 	}
@@ -711,6 +622,9 @@ func syncExistingPods(ctx context.Context, state *collectorState) {
 // streams alive for every running pod/container.
 func watchPods(ctx context.Context, state *collectorState) {
 	args := []string{"get", "pods", "--all-namespaces", "--watch", "-o", "json"}
+	if nodeName != "" {
+		args = append(args, "--field-selector", "spec.nodeName="+nodeName)
+	}
 	if kubeconfig != "" {
 		args = append(args, "--kubeconfig", kubeconfig)
 	}
@@ -1487,8 +1401,9 @@ func main() {
 	// Start cleanup goroutine
 	startCleanup()
 
-	// Start leader election / global log collector
-	go runLeaderElection(ctx)
+	// Start node-local log collector (DaemonSet mode).
+	// If NODE_NAME is empty it falls back to collecting from all nodes.
+	go runLogCollector(ctx)
 
 	mux := http.NewServeMux()
 
