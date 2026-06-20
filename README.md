@@ -8,9 +8,11 @@
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-13+-4169E1?logo=postgresql&logoColor=white)](https://postgresql.org)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.25+-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io)
 
-**Dark-themed web UI for tailing Kubernetes pod logs in real-time with history support.**
+**Dark-themed web UI for viewing and searching Kubernetes pod logs with automatic collection and persistent history.**
 
-Powered by `kubectl logs` on the backend, a single Go binary, and PostgreSQL storage. Multi-replica ready.
+LogaL runs as a single Go binary, watches every pod in the cluster using `kubectl logs`, stores all logs in PostgreSQL, and serves them through a fast web UI. It uses leader election so only one pod collects logs while standby replicas provide high availability.
+
+> **No `stern` dependency.** LogaL streams logs directly through `kubectl logs --follow`, so the container image stays small and has no extra CLI tools beyond `kubectl`.
 
 ---
 
@@ -47,9 +49,11 @@ kubectl apply -f deployment.yaml
 
 ## ✨ Features
 
+- **Automatic log collection** — watches all pods in all namespaces and stores every container's logs in PostgreSQL.
+- **Leader election** — only one pod collects logs; standby replicas take over automatically during rolling updates or failures.
 - **Dark theme** UI optimized for long log sessions.
 - **Real-time streaming** via Server-Sent Events (`kubectl logs`).
-- **History** stored in PostgreSQL with automatic cleanup (default 3 days).
+- **Persistent history** in PostgreSQL with configurable retention (`LOG_RETENTION_DAYS`).
 - **Custom time range** picker with live UTC hints and per-row filtering.
 - **Multi-pod / multi-container** selector, smart sidecar OFF by default.
 - **Grep filter** applied both in real-time and history.
@@ -63,16 +67,60 @@ kubectl apply -f deployment.yaml
 
 ## 🏗️ Architecture
 
+LogaL uses **leader election** so only one pod actively collects logs, while the other replicas stay on standby and take over automatically if the leader disappears.
+
 ```mermaid
 graph LR
     A[Browser] -->|HTTP / SSE| B(LogaL Server)
+    B -->|leader election| D[(PostgreSQL)]
     B -->|kubectl logs --follow| C[Kubernetes Cluster]
-    B -->|INSERT / SELECT| D[(PostgreSQL)]
+    B -->|INSERT / SELECT| D
     D -->|history stream| B
     B -->|SSE| A
 ```
 
-### Real-time mode
+### Leader election
+
+```mermaid
+sequenceDiagram
+    participant P1 as LogaL Pod 1
+    participant P2 as LogaL Pod 2
+    participant DB as PostgreSQL
+
+    P1->>DB: acquire lease
+    DB-->>P1: success
+    P2->>DB: acquire lease
+    DB-->>P2: failed (held by P1)
+    P2->>P2: sleep & retry
+    P1-->>P1: watch pods & stream logs
+
+    Note over P1,DB: P1 renews lease every 5s
+
+    P1-xP1: terminated
+    P2->>DB: acquire lease
+    DB-->>P2: success
+    P2-->>P2: become leader, start collector
+```
+
+### Log collection mode (auto-collect)
+
+```mermaid
+sequenceDiagram
+    participant L as LogaL Leader
+    participant K as Kubernetes API
+    participant D as PostgreSQL
+
+    loop watch pods
+        K->>L: pod ADDED / MODIFIED / DELETED
+        L->>L: start/stop per-container streams
+    end
+    loop per running container
+        K->>L: log lines
+        L->>D: INSERT log
+    end
+```
+
+### On-demand streaming mode
 
 ```mermaid
 sequenceDiagram
@@ -87,16 +135,9 @@ sequenceDiagram
         D->>L: rows
         L->>U: SSE data lines
     and live
-        loop every 3s
-            L->>K: list pods by selector
-            K->>L: pod list
-        end
-        loop per pod/container
-            L->>K: kubectl logs --follow
-            K->>L: log lines
-            L->>D: INSERT log
-            L->>U: SSE data line
-        end
+        L->>K: kubectl logs --follow per pod/container
+        K->>L: log lines
+        L->>U: SSE data line
     end
 ```
 
@@ -118,11 +159,14 @@ sequenceDiagram
 ### Flow
 
 ```
+User opens LogaL UI
+         ↓
+Leader pod already collecting all cluster logs
+         ↓
 User selects workload + time range
          ↓
-LogaL checks:
-  History in PostgreSQL? → query DB → stream to browser (history)
-  kubectl logs runs in parallel → new logs keep coming (real-time)
+LogaL queries PostgreSQL history → stream to browser (history)
+LogaL also starts live kubectl logs → stream new logs in real-time
          ↓
 Browser displays:
   - Scroll up   = history logs
@@ -167,8 +211,13 @@ go build -o logal-migrate ./cmd/migrate
 ### Build Docker image
 
 ```bash
+# Single platform (local)
 docker build -t your-registry/logal:latest .
 docker push your-registry/logal:latest
+
+# Multi-platform (for mixed local M-series Mac and Linux EKS/AMD64 clusters)
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t your-registry/logal:latest --push .
 ```
 
 ---
@@ -180,12 +229,20 @@ docker push your-registry/logal:latest
 | `PORT` | `8080` | HTTP server port |
 | `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/logal` | **Required** PostgreSQL connection string |
 | `KUBECONFIG` | `~/.kube/config` | Path to kubeconfig (optional for multi-cluster) |
-| `LOG_RETENTION_DAYS` | `3` | How many days of log history to keep |
-| `ALLOWED_NAMESPACES` | *(empty)* | Comma-separated namespace whitelist (optional) |
+| `LOG_RETENTION_DAYS` | `7` | How many days of log history to keep. The UI time-range dropdown is generated from this value. |
+| `ALLOWED_NAMESPACES` | *(empty)* | Comma-separated namespace whitelist (optional). Empty = all namespaces. |
+| `POD_NAME` | `logal-local` | Pod identity used for leader election (set automatically in Kubernetes via downward API) |
 
 ---
 
 ## 🚢 Deployment
+
+The included `deployment.yaml` creates:
+- `logging` namespace
+- ServiceAccount + ClusterRole + ClusterRoleBinding (read pods, logs, namespaces, workloads)
+- **Deployment** with 2 replicas, leader election, and rolling update strategy
+- **Service** for the UI/API
+- Optional **Ingress** template (commented)
 
 ### Single Cluster (in-cluster)
 
@@ -197,7 +254,18 @@ kubectl create secret generic logal-db \
 
 # 2. Deploy
 kubectl apply -f deployment.yaml
+
+# 3. Open port-forward (or expose via Ingress)
+kubectl port-forward -n logging svc/logal 8080:80
 ```
+
+### How it works after deploy
+
+1. Both pods start and try to acquire the leader lease in PostgreSQL.
+2. One pod becomes the **leader** and begins watching all pods.
+3. The leader starts a `kubectl logs --follow` stream for every container in every running pod and inserts every line into PostgreSQL.
+4. The second pod stays **standby** and takes over if the leader fails or is rolled out.
+5. Open the UI and pick any workload — the history is already there.
 
 ### Multi-Cluster
 
@@ -294,9 +362,11 @@ This project is licensed under the [MIT License](LICENSE).
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-13+-4169E1?logo=postgresql&logoColor=white)](https://postgresql.org)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.25+-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io)
 
-**Web UI bertema gelap untuk melihat log Kubernetes pods secara real-time beserta riwayat log.**
+**Web UI bertema gelap untuk melihat, mencari, dan mengumpulkan log Kubernetes pods secara otomatis dengan riwayat tersimpan.**
 
-Menggunakan `kubectl logs` di backend, binary Go tunggal, dan penyimpanan PostgreSQL. Siap multi-replica, tidak perlu pengetahuan database untuk menjalankannya.
+LogaL berjalan sebagai binary Go tunggal, memantau setiap pod di cluster menggunakan `kubectl logs`, menyimpan semua log ke PostgreSQL, dan menyajikannya melalui UI web. Menggunakan leader election sehingga hanya satu pod yang mengumpulkan log sementara replica standby memberikan high availability.
+
+> **Tidak ada dependensi `stern`.** LogaL streaming log langsung via `kubectl logs --follow`, jadi image container tetap kecil dan tidak membutuhkan CLI tool tambahan selain `kubectl`.
 
 ---
 
@@ -333,9 +403,11 @@ kubectl apply -f deployment.yaml
 
 ## ✨ Fitur
 
+- **Pengumpulan log otomatis** — memantau semua pod di semua namespace dan menyimpan log setiap container ke PostgreSQL.
+- **Leader election** — hanya satu pod yang mengumpulkan log; replica standby mengambil alih secara otomatis saat rolling update atau kegagalan.
 - **Dark theme** UI yang nyaman untuk sesi log panjang.
 - **Streaming real-time** via Server-Sent Events (`kubectl logs`).
-- **History** tersimpan di PostgreSQL dengan auto-cleanup (default 3 hari).
+- **Riwayat tersimpan** di PostgreSQL dengan retention configurable (`LOG_RETENTION_DAYS`).
 - **Custom time range** picker dengan hint UTC live dan filter per baris.
 - **Multi-pod / multi-container** selector, sidecar OFF secara default.
 - **Filter grep** untuk real-time dan history.
@@ -349,16 +421,60 @@ kubectl apply -f deployment.yaml
 
 ## 🏗️ Arsitektur
 
+LogaL menggunakan **leader election** sehingga hanya satu pod yang aktif mengumpulkan log, sementara replica lainnya standby dan mengambil alih secara otomatis jika leader hilang.
+
 ```mermaid
 graph LR
     A[Browser] -->|HTTP / SSE| B(LogaL Server)
+    B -->|leader election| D[(PostgreSQL)]
     B -->|kubectl logs --follow| C[Cluster Kubernetes]
-    B -->|INSERT / SELECT| D[(PostgreSQL)]
+    B -->|INSERT / SELECT| D
     D -->|stream history| B
     B -->|SSE| A
 ```
 
-### Mode real-time
+### Leader election
+
+```mermaid
+sequenceDiagram
+    participant P1 as LogaL Pod 1
+    participant P2 as LogaL Pod 2
+    participant DB as PostgreSQL
+
+    P1->>DB: acquire lease
+    DB-->>P1: success
+    P2->>DB: acquire lease
+    DB-->>P2: failed (held by P1)
+    P2->>P2: sleep & retry
+    P1-->>P1: watch pods & stream logs
+
+    Note over P1,DB: P1 renews lease every 5s
+
+    P1-xP1: terminated
+    P2->>DB: acquire lease
+    DB-->>P2: success
+    P2-->>P2: become leader, start collector
+```
+
+### Mode pengumpulan otomatis (auto-collect)
+
+```mermaid
+sequenceDiagram
+    participant L as LogaL Leader
+    participant K as Kubernetes API
+    participant D as PostgreSQL
+
+    loop watch pods
+        K->>L: pod ADDED / MODIFIED / DELETED
+        L->>L: start/stop per-container streams
+    end
+    loop per running container
+        K->>L: log lines
+        L->>D: INSERT log
+    end
+```
+
+### Mode streaming on-demand
 
 ```mermaid
 sequenceDiagram
@@ -373,16 +489,9 @@ sequenceDiagram
         D->>L: baris
         L->>U: SSE data lines
     and live
-        loop setiap 3 detik
-            L->>K: list pods berdasarkan selector
-            K->>L: daftar pod
-        end
-        loop per pod/container
-            L->>K: kubectl logs --follow
-            K->>L: baris log
-            L->>D: INSERT log
-            L->>U: SSE data line
-        end
+        L->>K: kubectl logs --follow per pod/container
+        K->>L: baris log
+        L->>U: SSE data line
     end
 ```
 
@@ -404,11 +513,14 @@ sequenceDiagram
 ### Alur Kerja
 
 ```
+User membuka LogaL UI
+         ↓
+Pod leader sudah mengumpulkan semua log cluster
+         ↓
 User pilih workload + time range
          ↓
-LogaL cek:
-  Ada history di PostgreSQL? → query DB → stream ke browser (history)
-  kubectl logs berjalan paralel → log baru terus masuk (real-time)
+LogaL query PostgreSQL history → stream ke browser (history)
+LogaL juga start live kubectl logs → stream log baru real-time
          ↓
 Browser tampilkan:
   - Scroll ke atas   = log history
@@ -453,8 +565,13 @@ go build -o logal-migrate ./cmd/migrate
 ### Build Docker image
 
 ```bash
+# Single platform (lokal)
 docker build -t your-registry/logal:latest .
 docker push your-registry/logal:latest
+
+# Multi-platform (untuk Mac M-series + cluster Linux EKS/AMD64)
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t your-registry/logal:latest --push .
 ```
 
 ---
@@ -466,12 +583,20 @@ docker push your-registry/logal:latest
 | `PORT` | `8080` | Port HTTP server |
 | `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/logal` | **Wajib** PostgreSQL connection string |
 | `KUBECONFIG` | `~/.kube/config` | Path ke kubeconfig (opsional untuk multi-cluster) |
-| `LOG_RETENTION_DAYS` | `3` | Berapa hari log history disimpan |
-| `ALLOWED_NAMESPACES` | *(kosong)* | Whitelist namespace, dipisah koma (opsional) |
+| `LOG_RETENTION_DAYS` | `7` | Berapa hari log history disimpan. Dropdown time range UI dibuat dari nilai ini. |
+| `ALLOWED_NAMESPACES` | *(kosong)* | Whitelist namespace, dipisah koma (opsional). Kosong = semua namespace. |
+| `POD_NAME` | `logal-local` | Identitas pod untuk leader election (otomatis di-set via downward API di Kubernetes) |
 
 ---
 
 ## 🚢 Deployment
+
+File `deployment.yaml` menyediakan:
+- Namespace `logging`
+- ServiceAccount, ClusterRole, dan ClusterRoleBinding (read pods, logs, namespaces, workloads)
+- Deployment dengan 2 replica, leader election, dan rolling update strategy
+- Service untuk UI/API
+- Template Ingress (tercomment)
 
 ### Single Cluster (in-cluster)
 
@@ -483,7 +608,18 @@ kubectl create secret generic logal-db \
 
 # 2. Deploy
 kubectl apply -f deployment.yaml
+
+# 3. Akses via port-forward (atau expose via Ingress)
+kubectl port-forward -n logging svc/logal 8080:80
 ```
+
+### Cara kerja setelah deploy
+
+1. Kedua pod start dan mencoba mengambil leader lease di PostgreSQL.
+2. Satu pod menjadi **leader** dan mulai memantau semua pod.
+3. Leader menjalankan `kubectl logs --follow` untuk setiap container di setiap pod yang Running dan menyimpan setiap baris ke PostgreSQL.
+4. Pod kedua tetap **standby** dan mengambil alih jika leader gagal atau di-rollout.
+5. Buka UI dan pilih workload apa saja — history-nya sudah tersedia.
 
 ### Multi-Cluster
 

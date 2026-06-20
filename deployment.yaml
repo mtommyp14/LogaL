@@ -1,16 +1,26 @@
 # LogaL — All-in-one Kubernetes manifest
 # Includes: Namespace, RBAC, Deployment, Service
 #
-# Requirements: PostgreSQL database. Set DATABASE_URL via secret before applying.
+# What it does:
+#   - Deploys 2 replicas of LogaL in the `logging` namespace.
+#   - One pod becomes the leader via PostgreSQL lease and auto-collects logs
+#     from every pod/container in every namespace.
+#   - The second pod stays on standby and takes over if the leader fails.
+#   - Exposes the UI/API on port 8080 through a ClusterIP Service.
 #
-# Single cluster (in-cluster):
+# Requirements:
+#   - PostgreSQL database reachable from the cluster.
+#   - Create the logal-db secret before applying this manifest.
+#
+# Quick deploy (single cluster):
 #   kubectl create secret generic logal-db \
 #     --from-literal=url="postgres://user:pass@host:5432/logal" -n logging
 #   kubectl apply -f deployment.yaml
 #
-# Multi-cluster (with kubeconfig):
+# Multi-cluster (optional):
 #   kubectl create secret generic logal-kubeconfig \
 #     --from-file=config=./merged-kubeconfig -n logging
+#   # then uncomment the KUBECONFIG env and kubeconfig volume in the Deployment
 #   kubectl apply -f deployment.yaml
 
 ---
@@ -66,6 +76,8 @@ metadata:
   labels:
     app: logal
 spec:
+  # Run 2 replicas for high availability. Only the leader collects logs;
+  # the standby replica takes over automatically during rolling updates.
   replicas: 2
   strategy:
     type: RollingUpdate
@@ -91,32 +103,40 @@ spec:
           name: http
 
         env:
+        # Web server port
         - name: PORT
           value: "8080"
+        # Unique pod name used by leader election (downward API)
         - name: POD_NAME
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
+        # PostgreSQL connection string (required)
         - name: DATABASE_URL
           valueFrom:
             secretKeyRef:
               name: logal-db
               key: url
+        # Number of days to keep log history in PostgreSQL.
+        # The UI time-range dropdown is generated from this value.
         - name: LOG_RETENTION_DAYS
           value: "7"
-        # Uncomment untuk multi-cluster:
+        # Optional: restrict log collection to specific namespaces.
+        # Empty means collect logs from all namespaces.
+        # - name: ALLOWED_NAMESPACES
+        #   value: "staging,production"
+        # Optional: multi-cluster support (requires kubeconfig volume below)
         # - name: KUBECONFIG
         #   value: "/kubeconfig/config"
-        # Uncomment untuk restrict namespace:
-        # - name: ALLOWED_NAMESPACES
-        #   value: "staging,n8n-devops,production"
 
         volumeMounts:
-        # Uncomment untuk multi-cluster:
+        # Optional: mount merged kubeconfig for multi-cluster mode
         # - name: kubeconfig
         #   mountPath: /kubeconfig
         #   readOnly: true
 
+        # Resource limits are intentionally generous because the leader pod
+        # runs many concurrent kubectl log streams in large clusters.
         resources:
           requests:
             cpu: 200m
@@ -140,13 +160,15 @@ spec:
           periodSeconds: 30
 
       volumes:
-      # Uncomment untuk multi-cluster:
+      # Optional: merged kubeconfig for multi-cluster mode
       # - name: kubeconfig
       #   secret:
       #     secretName: logal-kubeconfig
 
 ---
 # ── Service ───────────────────────────────────────────────────────────────────
+# Exposes the LogaL UI/API on port 80 inside the cluster.
+# Use port-forward, an Ingress, or a LoadBalancer to access from outside.
 apiVersion: v1
 kind: Service
 metadata:
