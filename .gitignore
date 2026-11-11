@@ -43,3 +43,8 @@ Thumbs.db
 # Build artifacts
 dist/
 build/
+
+# Local Kubernetes sandbox artifacts and credentials
+.sandbox/
+
+sandbox/__pycache__/

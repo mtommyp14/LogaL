@@ -7,6 +7,7 @@
 #   - Stores all logs in a central PostgreSQL database.
 #   - Exposes the UI/API on port 8080 through a ClusterIP Service.
 #
+#
 # Requirements:
 #   - PostgreSQL database reachable from the cluster.
 #   - Create the logal-db secret before applying this manifest.

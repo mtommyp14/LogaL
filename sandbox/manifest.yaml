@@ -1,0 +1,236 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logal-sandbox
+  labels:
+    app.kubernetes.io/part-of: logal-sandbox
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logal-sandbox-denied
+  labels:
+    app.kubernetes.io/part-of: logal-sandbox
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: logal
+  namespace: logal-sandbox
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: logal-sandbox-reader
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: logal-sandbox-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: logal-sandbox-reader
+subjects:
+- kind: ServiceAccount
+  name: logal
+  namespace: logal-sandbox
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: logal-sandbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: logal-sandbox-db}
+  template:
+    metadata:
+      labels: {app: logal-sandbox-db}
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:17-alpine
+        env:
+        - {name: POSTGRES_DB, value: logal}
+        - {name: POSTGRES_USER, value: logal}
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: sandbox-credentials, key: database-password}
+        readinessProbe:
+          exec: {command: ["pg_isready", "-U", "logal", "-d", "logal"]}
+          initialDelaySeconds: 3
+          periodSeconds: 2
+        resources:
+          requests: {cpu: 100m, memory: 128Mi}
+          limits: {cpu: "1", memory: 512Mi}
+        volumeMounts:
+        - {name: data, mountPath: /var/lib/postgresql/data}
+      volumes:
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: logal-sandbox
+spec:
+  selector: {app: logal-sandbox-db}
+  ports: [{port: 5432, targetPort: 5432}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logal
+  namespace: logal-sandbox
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: logal-sandbox-ui}
+  template:
+    metadata:
+      labels: {app: logal-sandbox-ui}
+    spec:
+      serviceAccountName: logal
+      containers:
+      - name: logal
+        image: logal:sandbox-verified
+        imagePullPolicy: Never
+        ports: [{name: http, containerPort: 8080}]
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef: {name: sandbox-credentials, key: database-url}
+        - name: AUTH_USERNAME
+          valueFrom:
+            secretKeyRef: {name: sandbox-credentials, key: username}
+        - name: AUTH_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: sandbox-credentials, key: password}
+        - {name: ALLOWED_NAMESPACES, value: logal-sandbox}
+        - {name: LOG_RETENTION_DAYS, value: "3"}
+        readinessProbe:
+          httpGet: {path: /healthz, port: http}
+          periodSeconds: 2
+        resources:
+          requests: {cpu: 100m, memory: 128Mi}
+          limits: {cpu: "2", memory: 512Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logal
+  namespace: logal-sandbox
+spec:
+  selector: {app: logal-sandbox-ui}
+  ports: [{name: http, port: 8080, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-api
+  namespace: logal-sandbox
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {test-workload: api}
+  template:
+    metadata:
+      labels: {test-workload: api}
+    spec:
+      initContainers:
+      - name: init-config
+        image: busybox:1.37
+        command: [sh, -c, 'echo "INFO SANDBOX_INIT ready"']
+      containers:
+      - name: app
+        image: busybox:1.37
+        command:
+        - sh
+        - -c
+        - |
+          i=0
+          while true; do
+            echo "INFO SANDBOX_API pod=$HOSTNAME seq=$i"
+            echo 'WARN SANDBOX_QUOTED {"value":"hello","path":"C:\\tmp","html":"<tag>"}'
+            if [ $((i % 5)) -eq 0 ]; then echo "ERROR SANDBOX_ERROR pod=$HOSTNAME seq=$i"; fi
+            i=$((i+1))
+            sleep 2
+          done
+      - name: istio-proxy
+        image: busybox:1.37
+        command: [sh, -c, 'while true; do echo "INFO SANDBOX_SIDECAR"; sleep 3; done']
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: demo-worker
+  namespace: logal-sandbox
+spec:
+  serviceName: demo-worker
+  replicas: 1
+  selector:
+    matchLabels: {test-workload: worker}
+  template:
+    metadata:
+      labels: {test-workload: worker}
+    spec:
+      containers:
+      - name: worker
+        image: busybox:1.37
+        command: [sh, -c, 'while true; do echo "INFO SANDBOX_WORKER pod=$HOSTNAME"; sleep 2; done']
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-worker
+  namespace: logal-sandbox
+spec:
+  clusterIP: None
+  selector: {test-workload: worker}
+  ports: [{port: 80}]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: demo-agent
+  namespace: logal-sandbox
+spec:
+  selector:
+    matchLabels: {test-workload: agent}
+  template:
+    metadata:
+      labels: {test-workload: agent}
+    spec:
+      containers:
+      - name: agent
+        image: busybox:1.37
+        command: [sh, -c, 'while true; do echo "INFO SANDBOX_AGENT pod=$HOSTNAME"; sleep 2; done']
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forbidden-app
+  namespace: logal-sandbox-denied
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {test-workload: forbidden}
+  template:
+    metadata:
+      labels: {test-workload: forbidden}
+    spec:
+      containers:
+      - name: app
+        image: busybox:1.37
+        command: [sh, -c, 'while true; do echo "ERROR SANDBOX_FORBIDDEN"; sleep 2; done']
