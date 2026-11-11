@@ -81,6 +81,8 @@ func isSidecarContainer(name string) bool {
 // ── Kubectl helper ────────────────────────────────────────────────────────────
 
 func kubectl(ctx context.Context, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, "kubectl", args...)
 	if kubeconfig != "" {
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfig)
@@ -91,24 +93,12 @@ func kubectl(ctx context.Context, args ...string) ([]byte, error) {
 // ── API: contexts ─────────────────────────────────────────────────────────────
 
 func handleContexts(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	args := []string{"config", "get-contexts", "-o", "name"}
-	out, err := kubectl(ctx, args...)
+	clusters, err := configuredClusters(r.Context())
 	if err != nil {
-		// in-cluster fallback
-		jsonResp(w, []string{"in-cluster"})
+		http.Error(w, "failed to list clusters", 502)
 		return
 	}
-	var contexts []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			contexts = append(contexts, line)
-		}
-	}
-	if len(contexts) == 0 {
-		contexts = []string{"in-cluster"}
-	}
-	jsonResp(w, contexts)
+	jsonResp(w, clusters)
 }
 
 // ── API: namespaces ───────────────────────────────────────────────────────────
@@ -136,7 +126,7 @@ func handleNamespaces(w http.ResponseWriter, r *http.Request) {
 		for _, ns := range strings.Split(allowedNamespaces, ",") {
 			allowed[strings.TrimSpace(ns)] = true
 		}
-		var filtered []string
+		filtered := []string{}
 		for _, ns := range all {
 			if allowed[ns] {
 				filtered = append(filtered, ns)
@@ -164,7 +154,7 @@ func handleWorkloads(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var result []Workload
+	result := []Workload{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -267,7 +257,7 @@ func handlePods(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var pods []PodInfo
+	pods := []PodInfo{}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
 			continue
@@ -320,8 +310,13 @@ func handlePodAge(w http.ResponseWriter, r *http.Request) {
 	ns := r.URL.Query().Get("ns")
 	workload := r.URL.Query().Get("workload")
 
-	args := []string{"get", "pods", "-n", ns,
-		"-o", "jsonpath={.items[0].metadata.name}{\"\\t\"}{.items[0].status.startTime}"}
+	pods := listWorkloadPods(ctx, ctxName, ns, workload, r.URL.Query().Get("kind"))
+	if len(pods) == 0 {
+		http.Error(w, "pod not found", 404)
+		return
+	}
+	args := []string{"get", "pod", pods[0].Name, "-n", ns, "-o", `jsonpath={.metadata.name}{"\t"}{.status.startTime}`}
+
 	if ctxName != "" && ctxName != "in-cluster" {
 		args = append([]string{"--context", ctxName}, args...)
 	}
@@ -442,6 +437,7 @@ func initDB(ctx context.Context) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("pgxpool.New: %w", err)
 	}
 	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
 	_, err = pool.Exec(ctx, `
@@ -462,6 +458,7 @@ func initDB(ctx context.Context) (*pgxpool.Pool, error) {
 		CREATE INDEX IF NOT EXISTS idx_logs_message ON logs USING gin(to_tsvector('english', message));
 	`)
 	if err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
 	return pool, nil
@@ -477,7 +474,7 @@ func insertLogLine(ctx context.Context, l LogLine) error {
 
 // streamHistoryFiles streams historical log lines from PostgreSQL for the given date range.
 // Output lines use the same plain-text format as the original flat files.
-func streamHistoryFiles(ctx context.Context, cluster, ns, workload string, since time.Time, until *time.Time, filter string, out chan<- string) {
+func streamHistoryFiles(ctx context.Context, cluster, ns, workload string, since time.Time, until *time.Time, filter, pods, containers string, out chan<- string) {
 	args := []interface{}{cluster, ns, workload, since.UTC()}
 	sql := `SELECT ts, pod, container, level, message FROM logs
 	        WHERE cluster=$1 AND namespace=$2 AND workload=$3 AND ts >= $4`
@@ -489,7 +486,13 @@ func streamHistoryFiles(ctx context.Context, cluster, ns, workload string, since
 		sql += fmt.Sprintf(` AND message ILIKE '%%' || $%d || '%%'`, len(args)+1)
 		args = append(args, filter)
 	}
-	sql += ` ORDER BY ts ASC`
+	for _, selection := range []struct{ column, value string }{{"pod", pods}, {"container", containers}} {
+		if selection.value != "" {
+			args = append(args, strings.Split(selection.value, ","))
+			sql += fmt.Sprintf(" AND %s = ANY($%d::text[])", selection.column, len(args))
+		}
+	}
+	sql += ` ORDER BY ts ASC, id ASC`
 
 	rows, err := dbPool.Query(ctx, sql, args...)
 	if err != nil {
@@ -532,14 +535,15 @@ type containerKey struct {
 // podContainerState holds the cancel function for a running container stream.
 type collectorState struct {
 	mu       sync.Mutex
+	cluster  string
 	streams  map[containerKey]context.CancelFunc
 	podNames map[podKey]bool
 }
 
-// runLogCollector is the leader-only background loop that watches all pods
-// and streams every container's logs into PostgreSQL.
-func runLogCollector(ctx context.Context) {
+// runLogCollector watches pods in one context and persists their container logs.
+func runLogCollector(ctx context.Context, cluster string) {
 	state := &collectorState{
+		cluster:  cluster,
 		streams:  make(map[containerKey]context.CancelFunc),
 		podNames: make(map[podKey]bool),
 	}
@@ -570,6 +574,9 @@ func runLogCollector(ctx context.Context) {
 // emits events for changes after the watch starts.
 func syncExistingPods(ctx context.Context, state *collectorState) {
 	args := []string{"get", "pods", "--all-namespaces", "-o", "json"}
+	if state.cluster != "in-cluster" {
+		args = append(args, "--context", state.cluster)
+	}
 	if nodeName != "" {
 		args = append(args, "--field-selector", "spec.nodeName="+nodeName)
 	}
@@ -586,11 +593,12 @@ func syncExistingPods(ctx context.Context, state *collectorState) {
 	var list struct {
 		Items []struct {
 			Metadata struct {
-				Name      string `json:"name"`
-				Namespace string `json:"namespace"`
+				Name            string           `json:"name"`
+				Namespace       string           `json:"namespace"`
+				OwnerReferences []ownerReference `json:"ownerReferences"`
 			} `json:"metadata"`
 			Spec struct {
-				Containers     []struct {
+				Containers []struct {
 					Name string `json:"name"`
 				} `json:"containers"`
 				InitContainers []struct {
@@ -607,7 +615,9 @@ func syncExistingPods(ctx context.Context, state *collectorState) {
 		return
 	}
 
+	seen := make(map[podKey]bool)
 	for _, item := range list.Items {
+		seen[podKey{Namespace: item.Metadata.Namespace, Name: item.Metadata.Name}] = true
 		event := podWatchEvent{Type: "ADDED"}
 		event.Object.Metadata = item.Metadata
 		event.Object.Spec.Containers = item.Spec.Containers
@@ -615,13 +625,27 @@ func syncExistingPods(ctx context.Context, state *collectorState) {
 		event.Object.Status.Phase = item.Status.Phase
 		state.handlePodEvent(ctx, event)
 	}
+	state.mu.Lock()
+	var stale []podKey
+	for key := range state.podNames {
+		if !seen[key] {
+			stale = append(stale, key)
+		}
+	}
+	state.mu.Unlock()
+	for _, key := range stale {
+		state.stopPod(key)
+	}
 	log.Printf("[collector] synced %d existing pods", len(list.Items))
 }
 
 // watchPods runs `kubectl get pods --all-namespaces --watch` and keeps log
 // streams alive for every running pod/container.
 func watchPods(ctx context.Context, state *collectorState) {
-	args := []string{"get", "pods", "--all-namespaces", "--watch", "-o", "json"}
+	args := []string{"get", "pods", "--all-namespaces", "--watch", "--output-watch-events", "-o", "json"}
+	if state.cluster != "in-cluster" {
+		args = append(args, "--context", state.cluster)
+	}
 	if nodeName != "" {
 		args = append(args, "--field-selector", "spec.nodeName="+nodeName)
 	}
@@ -687,11 +711,12 @@ type podWatchEvent struct {
 		APIVersion string `json:"apiVersion"`
 		Kind       string `json:"kind"`
 		Metadata   struct {
-			Name      string `json:"name"`
-			Namespace string `json:"namespace"`
+			Name            string           `json:"name"`
+			Namespace       string           `json:"namespace"`
+			OwnerReferences []ownerReference `json:"ownerReferences"`
 		} `json:"metadata"`
 		Spec struct {
-			Containers     []struct {
+			Containers []struct {
 				Name string `json:"name"`
 			} `json:"containers"`
 			InitContainers []struct {
@@ -711,11 +736,11 @@ func (s *collectorState) handlePodEvent(ctx context.Context, e podWatchEvent) {
 	key := podKey{Namespace: ns, Name: pod}
 
 	// Ignore pods that are not yet running or already terminating.
+	if !namespaceAllowed(ns) {
+		return
+	}
 	if phase != "Running" && phase != "Pending" {
-		// For delete events, stop immediately.
-		if e.Type == "DELETED" {
-			s.stopPod(key)
-		}
+		s.stopPod(key)
 		return
 	}
 
@@ -733,6 +758,7 @@ func (s *collectorState) handlePodEvent(ctx context.Context, e podWatchEvent) {
 		containers = append(containers, c.Name)
 	}
 
+	workload := workloadForPod(ctx, s.cluster, ns, pod, e.Object.Metadata.OwnerReferences)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -745,7 +771,7 @@ func (s *collectorState) handlePodEvent(ctx context.Context, e podWatchEvent) {
 		}
 		cctx, cancel := context.WithCancel(ctx)
 		s.streams[ck] = cancel
-		go streamContainerLogsForCollector(cctx, ns, pod, c)
+		go streamContainerLogsForCollector(cctx, s.cluster, ns, workload, pod, c)
 		log.Printf("[collector] started %s/%s/%s", ns, pod, c)
 	}
 }
@@ -776,7 +802,8 @@ func (s *collectorState) stopAll() {
 
 // streamContainerLogsForCollector follows a single container's logs and writes
 // every line to PostgreSQL. It runs for the lifetime of the pod.
-func streamContainerLogsForCollector(ctx context.Context, ns, pod, container string) {
+func streamContainerLogsForCollector(ctx context.Context, cluster, ns, workload, pod, container string) {
+	var cursor logCursor
 	for {
 		select {
 		case <-ctx.Done():
@@ -784,11 +811,21 @@ func streamContainerLogsForCollector(ctx context.Context, ns, pod, container str
 		default:
 		}
 
-		args := []string{"logs", pod, "-n", ns, "-c", container, "--timestamps=true", "--follow", "--tail=100"}
+		args := []string{"logs", pod, "-n", ns, "-c", container, "--timestamps=true", "--follow"}
+		if cursor.last.IsZero() {
+			args = append(args, "--tail=100")
+		}
+		if cluster != "in-cluster" {
+			args = append(args, "--context", cluster)
+		}
 		if kubeconfig != "" {
 			args = append(args, "--kubeconfig", kubeconfig)
 		}
 
+		cursor.reconnect()
+		if !cursor.last.IsZero() {
+			args = append(args, "--since-time="+cursor.last.UTC().Format(time.RFC3339Nano))
+		}
 		cmd := exec.CommandContext(ctx, "kubectl", args...)
 		cmd.Env = os.Environ()
 		if kubeconfig != "" {
@@ -831,20 +868,23 @@ func streamContainerLogsForCollector(ctx context.Context, ns, pod, container str
 			case <-ctx.Done():
 				if cmd.Process != nil {
 					cmd.Process.Kill()
+					_ = cmd.Wait()
 				}
 				return
 			default:
 			}
 			raw := scanner.Text()
 			l := parseKubectlLogLine(raw, pod, container)
-			l.Cluster = "in-cluster"
-			if kubeconfig != "" {
-				l.Cluster = "kubeconfig"
+			if cursor.repeated(l.Ts, raw) {
+				continue
 			}
+			l.Cluster = cluster
 			l.Namespace = ns
-			l.Workload = podWorkloadKey(ns, pod)
+			l.Workload = workload
 			if err := insertLogLine(ctx, l); err != nil {
 				log.Printf("[db] insert error: %v", err)
+			} else {
+				cursor.record(l.Ts, raw)
 			}
 		}
 		scannerErr := scanner.Err()
@@ -856,13 +896,6 @@ func streamContainerLogsForCollector(ctx context.Context, ns, pod, container str
 		case <-time.After(2 * time.Second):
 		}
 	}
-}
-
-// podWorkloadKey returns a stable grouping key for the collector.
-// We don't know the parent workload name cheaply, so we group by namespace/pod
-// for the global collector and expose it as the workload field.
-func podWorkloadKey(ns, pod string) string {
-	return ns + "/" + pod
 }
 
 // ── Cleanup goroutine ─────────────────────────────────────────────────────────
@@ -895,7 +928,7 @@ type podContainer struct {
 }
 
 // listWorkloadPods lists pods for a workload using the same label selector logic as handlePods.
-func listWorkloadPods(ctxName, ns, workload, kind string) []podContainer {
+func listWorkloadPods(ctx context.Context, ctxName, ns, workload, kind string) []podContainer {
 	var labelSelector string
 	{
 		resType := strings.ToLower(kind)
@@ -907,7 +940,7 @@ func listWorkloadPods(ctxName, ns, workload, kind string) []podContainer {
 		if ctxName != "" && ctxName != "in-cluster" {
 			args = append([]string{"--context", ctxName}, args...)
 		}
-		out, err := kubectl(context.Background(), args...)
+		out, err := kubectl(ctx, args...)
 		if err == nil {
 			var labels map[string]string
 			if json.Unmarshal(out, &labels) == nil {
@@ -931,7 +964,7 @@ func listWorkloadPods(ctxName, ns, workload, kind string) []podContainer {
 		args = append([]string{"--context", ctxName}, args...)
 	}
 
-	out, err := kubectl(context.Background(), args...)
+	out, err := kubectl(ctx, args...)
 	if err != nil {
 		log.Printf("[list pods] error: %v", err)
 		return nil
@@ -997,7 +1030,8 @@ func parseKubectlLogLine(raw, pod, container string) LogLine {
 
 // streamContainerLogs follows logs for one container using kubectl logs --follow.
 // It reconnects automatically when the stream ends or fails.
-func streamContainerLogs(ctx context.Context, ctxName, ns, workload, pod, container string, sinceTime *time.Time, filter string, logCh chan<- string) {
+func streamContainerLogs(ctx context.Context, ctxName, ns, workload, pod, container string, sinceTime *time.Time, tail int, filter string, logCh chan<- string) {
+	var cursor logCursor
 	for {
 		select {
 		case <-ctx.Done():
@@ -1012,12 +1046,16 @@ func streamContainerLogs(ctx context.Context, ctxName, ns, workload, pod, contai
 		if kubeconfig != "" {
 			args = append(args, "--kubeconfig", kubeconfig)
 		}
-		if sinceTime != nil {
-			args = append(args, "--since-time", sinceTime.UTC().Format(time.RFC3339))
-		} else {
-			args = append(args, "--tail=100")
+		if sinceTime != nil && cursor.last.IsZero() {
+			args = append(args, "--since-time", sinceTime.UTC().Format(time.RFC3339Nano))
+		} else if cursor.last.IsZero() {
+			args = append(args, "--tail="+strconv.Itoa(tail))
 		}
 
+		cursor.reconnect()
+		if !cursor.last.IsZero() {
+			args = append(args, "--since-time="+cursor.last.UTC().Format(time.RFC3339Nano))
+		}
 		cmd := exec.CommandContext(ctx, "kubectl", args...)
 		cmd.Env = os.Environ()
 		if kubeconfig != "" {
@@ -1054,26 +1092,29 @@ func streamContainerLogs(ctx context.Context, ctxName, ns, workload, pod, contai
 			case <-ctx.Done():
 				if cmd.Process != nil {
 					cmd.Process.Kill()
+					_ = cmd.Wait()
 				}
 				return
 			default:
 			}
 			raw := scanner.Text()
 			l := parseKubectlLogLine(raw, pod, container)
+			if cursor.repeated(l.Ts, raw) {
+				continue
+			}
 			if filter != "" && !strings.Contains(strings.ToLower(l.Message), strings.ToLower(filter)) {
 				continue
 			}
 			l.Cluster = ctxName
 			l.Namespace = ns
 			l.Workload = workload
-			if err := insertLogLine(ctx, l); err != nil {
-				log.Printf("[db] insert error: %v", err)
-			}
 			select {
 			case logCh <- formatLogLine(l):
+				cursor.record(l.Ts, raw)
 			case <-ctx.Done():
 				if cmd.Process != nil {
 					cmd.Process.Kill()
+					_ = cmd.Wait()
 				}
 				return
 			}
@@ -1090,7 +1131,7 @@ func streamContainerLogs(ctx context.Context, ctxName, ns, workload, pod, contai
 }
 
 // streamWorkloadLogsKubectl polls pods for a workload and follows logs for each container.
-func streamWorkloadLogsKubectl(ctx context.Context, ctxName, ns, workload, kind, requestedPods, requestedContainers string, sinceTime *time.Time, filter string, logCh chan<- string) {
+func streamWorkloadLogsKubectl(ctx context.Context, ctxName, ns, workload, kind, requestedPods, requestedContainers string, sinceTime *time.Time, tail int, filter string, logCh chan<- string) {
 	requestedPodSet := map[string]bool{}
 	if requestedPods != "" {
 		for _, p := range strings.Split(requestedPods, ",") {
@@ -1112,7 +1153,7 @@ func streamWorkloadLogsKubectl(ctx context.Context, ctxName, ns, workload, kind,
 	var mu sync.Mutex
 
 	for {
-		podList := listWorkloadPods(ctxName, ns, workload, kind)
+		podList := listWorkloadPods(ctx, ctxName, ns, workload, kind)
 		for _, pc := range podList {
 			if len(requestedPodSet) > 0 && !requestedPodSet[pc.Name] {
 				continue
@@ -1134,7 +1175,7 @@ func streamWorkloadLogsKubectl(ctx context.Context, ctxName, ns, workload, kind,
 				mu.Unlock()
 
 				go func(pod, container string) {
-					streamContainerLogs(ctx, ctxName, ns, workload, pod, container, sinceTime, filter, logCh)
+					streamContainerLogs(ctx, ctxName, ns, workload, pod, container, sinceTime, tail, filter, logCh)
 					mu.Lock()
 					delete(active, key)
 					mu.Unlock()
@@ -1158,8 +1199,8 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 	workload := q.Get("workload")
 	filter := q.Get("filter")
 	sinceStr := q.Get("since")        // e.g. "30m", "1h", "2d", "realtime"
-	fromStr  := q.Get("from")         // ISO8601 custom range start
-	toStr    := q.Get("to")           // ISO8601 custom range end
+	fromStr := q.Get("from")          // ISO8601 custom range start
+	toStr := q.Get("to")              // ISO8601 custom range end
 	pods := q.Get("pods")             // comma-separated pod names
 	containers := q.Get("containers") // comma-separated container names
 
@@ -1168,61 +1209,75 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SSE headers
+	tail := 100
+	if value := q.Get("tail"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 {
+			http.Error(w, "invalid tail count", 400)
+			return
+		}
+		tail = parsed
+	}
+	if tail == 0 {
+		tail = -1
+	} // kubectl uses -1 for all available lines.
+	// Validate the range before sending streaming headers.
+	liveStart := time.Now().UTC()
+	var sinceTime, toTime *time.Time
+	isCustomRange := fromStr != ""
+	isRealtime := !isCustomRange && (sinceStr == "" || sinceStr == "realtime")
+	if toStr != "" && !isCustomRange {
+		http.Error(w, "from required with to", 400)
+		return
+	}
+	if isCustomRange {
+		from, err := time.Parse(time.RFC3339Nano, fromStr)
+		if err != nil {
+			http.Error(w, "invalid from timestamp", 400)
+			return
+		}
+		sinceTime = &from
+		to := liveStart
+		if toStr != "" {
+			to, err = time.Parse(time.RFC3339Nano, toStr)
+			if err != nil {
+				http.Error(w, "invalid to timestamp", 400)
+				return
+			}
+		}
+		if to.Before(from) {
+			http.Error(w, "to must be at or after from", 400)
+			return
+		}
+		toTime = &to
+	} else if !isRealtime {
+		dur := parseSince(sinceStr)
+		if dur <= 0 {
+			http.Error(w, "invalid since duration", 400)
+			return
+		}
+		since := liveStart.Add(-dur)
+		sinceTime = &since
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		http.Error(w, "streaming not supported", 500)
 		return
 	}
-
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-
 	logCh := make(chan string, 500)
 
-	// Parse since duration or custom range
-	var sinceTime *time.Time
-	var toTime *time.Time
-	isCustomRange := fromStr != ""
-	isRealtime := !isCustomRange && (sinceStr == "" || sinceStr == "realtime")
-
-	if isCustomRange {
-		// UI sends toISOString() which includes milliseconds: "2026-06-19T09:21:00.000Z"
-		// Try RFC3339Nano first, then RFC3339
-		parseTime := func(s string) (time.Time, error) {
-			if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-				return t.UTC(), nil
-			}
-			t, err := time.Parse(time.RFC3339, s)
-			return t.UTC(), err
-		}
-		if t, err := parseTime(fromStr); err == nil {
-			sinceTime = &t
-		}
-		if toStr != "" {
-			if t2, err := parseTime(toStr); err == nil {
-				toTime = &t2
-			}
-		}
-	} else if !isRealtime {
-		dur := parseSince(sinceStr)
-		if dur > 0 {
-			t := time.Now().Add(-dur)
-			sinceTime = &t
-		}
-	}
-
-	// Stream history from flat files first
+	// Stream persisted history first
 	if sinceTime != nil {
 		if isCustomRange && toTime != nil {
 			// Custom range: stream history (with exact time bounds) then send __END__, no live streaming
 			go func() {
-				streamHistoryFiles(ctx, ctxName, ns, workload, *sinceTime, toTime, filter, logCh)
+				streamHistoryFiles(ctx, ctxName, ns, workload, *sinceTime, toTime, filter, pods, containers, logCh)
 				// Safely send end sentinel (ctx may already be done)
 				select {
 				case logCh <- `{"__end__":true}`:
@@ -1232,7 +1287,7 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 			goto streamLoop
 		}
 		go func() {
-			streamHistoryFiles(ctx, ctxName, ns, workload, *sinceTime, nil, filter, logCh)
+			streamHistoryFiles(ctx, ctxName, ns, workload, *sinceTime, &liveStart, filter, pods, containers, logCh)
 		}()
 	}
 
@@ -1242,15 +1297,26 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 		if sinceTime != nil {
 			time.Sleep(100 * time.Millisecond)
 		}
-		streamWorkloadLogsKubectl(ctx, ctxName, ns, workload, q.Get("kind"), pods, containers, sinceTime, filter, logCh)
+		liveSince := &liveStart
+		if isRealtime {
+			liveSince = nil
+		}
+		streamWorkloadLogsKubectl(ctx, ctxName, ns, workload, q.Get("kind"), pods, containers, liveSince, tail, filter, logCh)
 	}()
 
 	// Send SSE to browser
 streamLoop:
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
 		case line, ok := <-logCh:
 			if !ok {
 				return
@@ -1340,11 +1406,11 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 
 func handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ctxName   := r.URL.Query().Get("ctx")
-	ns        := r.URL.Query().Get("ns")
-	pod       := r.URL.Query().Get("pod")
+	ctxName := r.URL.Query().Get("ctx")
+	ns := r.URL.Query().Get("ns")
+	pod := r.URL.Query().Get("pod")
 	container := r.URL.Query().Get("container")
-	isInit    := r.URL.Query().Get("init") == "true"
+	isInit := r.URL.Query().Get("init") == "true"
 
 	if ns == "" || pod == "" || container == "" {
 		http.Error(w, "ns, pod, container required", http.StatusBadRequest)
@@ -1389,6 +1455,9 @@ func handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	ctx := context.Background()
+	if err := validateAuth(); err != nil {
+		log.Fatal(err)
+	}
 
 	// Connect to PostgreSQL
 	pool, err := initDB(ctx)
@@ -1403,7 +1472,16 @@ func main() {
 
 	// Start node-local log collector (DaemonSet mode).
 	// If NODE_NAME is empty it falls back to collecting from all nodes.
-	go runLogCollector(ctx)
+	clusters, err := configuredClusters(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if nodeName != "" && (len(clusters) > 1 || kubeconfig != "") {
+		log.Fatal("kubeconfig/multi-cluster collection requires NODE_NAME unset and one collector replica")
+	}
+	for _, cluster := range clusters {
+		go runLogCollector(ctx, cluster)
+	}
 
 	mux := http.NewServeMux()
 
@@ -1425,8 +1503,8 @@ func main() {
 	mux.HandleFunc("/api/config", handleConfig)
 
 	log.Printf("LogaL starting on :%s", port)
-	log.Printf("Database: %s (retention: %d days)", databaseURL, retentionDays)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	log.Printf("Log retention: %d days", retentionDays)
+	if err := http.ListenAndServe(":"+port, protect(mux)); err != nil {
 		log.Fatal(err)
 	}
 }

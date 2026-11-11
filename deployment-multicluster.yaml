@@ -1,0 +1,87 @@
+# Central collector: one replica watches every context in the mounted kubeconfig.
+# Do not run a DaemonSet against the same contexts/database at the same time.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logal
+  namespace: logging
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: logal
+  template:
+    metadata:
+      labels:
+        app: logal
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - name: logal
+        image: mtommyp14/logal:latest
+        ports:
+        - name: http
+          containerPort: 8080
+        env:
+        - name: KUBECONFIG
+          value: /kubeconfig/config
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: logal-db
+              key: url
+        - name: AUTH_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: logal-auth
+              key: username
+        - name: AUTH_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: logal-auth
+              key: password
+        - name: LOG_RETENTION_DAYS
+          value: "7"
+        volumeMounts:
+        - name: kubeconfig
+          mountPath: /kubeconfig
+          readOnly: true
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+      volumes:
+      - name: kubeconfig
+        secret:
+          secretName: logal-kubeconfig
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logal
+  namespace: logging
+spec:
+  selector:
+    app: logal
+  ports:
+  - name: http
+    port: 80
+    targetPort: http

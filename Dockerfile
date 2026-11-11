@@ -2,7 +2,7 @@
 FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
-COPY go.mod go.sum main.go ui.html ./
+COPY go.mod go.sum *.go ui.html ./
 
 RUN go build -ldflags="-s -w" -o logal .
 
@@ -11,12 +11,13 @@ FROM alpine:3.19
 
 # kubectl version
 ARG KUBECTL_VERSION=v1.36.2
+ARG TARGETARCH
 
 # Install dependencies
 RUN apk add --no-cache ca-certificates curl
 
 # Install kubectl
-RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH:-amd64}/kubectl" \
     -o /usr/local/bin/kubectl && \
     chmod +x /usr/local/bin/kubectl
 

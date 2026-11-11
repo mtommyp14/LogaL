@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/mtommyp14/LogaL/actions/workflows/ci.yml/badge.svg)](https://github.com/mtommyp14/LogaL/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-13+-4169E1?logo=postgresql&logoColor=white)](https://postgresql.org)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.25+-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io)
 
@@ -25,6 +25,10 @@ cd LogaL
 # Set database (PostgreSQL required)
 export DATABASE_URL=postgres://user:pass@localhost:5432/logal
 
+# Protect UI and API (browser prompts for credentials)
+export AUTH_USERNAME=admin
+export AUTH_PASSWORD=change-this-password
+
 # Run
 ./start.sh
 ```
@@ -34,6 +38,10 @@ Then open http://localhost:8080.
 ### 2. Kubernetes
 
 ```bash
+kubectl create namespace logging
+kubectl create secret generic logal-auth -n logging \
+  --from-literal=username=admin --from-literal=password=change-this-password
+
 # 1. Create database secret
 kubectl create secret generic logal-db \
   --from-literal=url="postgres://logal:password@db-host:5432/logal" \
@@ -161,7 +169,7 @@ Custom range mode:
 - Kubernetes cluster (1.25+) or local `kubectl` access
 - PostgreSQL 13+
 - `kubectl` installed locally (for `start.sh`)
-- Go 1.22+ (for building from source)
+- Go 1.25+ (for building from source)
 
 ---
 
@@ -205,6 +213,8 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 | `PORT` | `8080` | HTTP server port |
 | `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/logal` | **Required** PostgreSQL connection string |
 | `KUBECONFIG` | `~/.kube/config` | Path to kubeconfig (optional for multi-cluster) |
+| `AUTH_USERNAME` / `AUTH_PASSWORD` | *(required)* | HTTP Basic credentials for UI and all APIs. Use HTTPS at the ingress. |
+| `AUTH_DISABLED` | `false` | Explicitly set `true` only for local development without authentication. |
 | `NODE_NAME` | `''` | Node name for local pod filtering (set via downward API in DaemonSet) |
 | `LOG_RETENTION_DAYS` | `7` | How many days of log history to keep. The UI time-range dropdown is generated from this value. |
 | `ALLOWED_NAMESPACES` | *(empty)* | Comma-separated namespace whitelist (optional). Empty = all namespaces. |
@@ -223,6 +233,10 @@ The included `daemonset.yaml` creates:
 ### Single Cluster (in-cluster)
 
 ```bash
+kubectl create namespace logging
+kubectl create secret generic logal-auth -n logging \
+  --from-literal=username=admin --from-literal=password=change-this-password
+
 # 1. Create database secret
 kubectl create secret generic logal-db \
   --from-literal=url="postgres://logal:password@db-host:5432/logal" \
@@ -244,33 +258,31 @@ kubectl port-forward -n logging svc/logal 8080:80
 
 ### Multi-Cluster
 
-```bash
-# 1. Merge kubeconfigs
-KUBECONFIG=./kube-a:./kube-b:./kube-c kubectl config view --flatten > merged
-
-# 2. Store as a Secret
-kubectl create secret generic logal-kubeconfig \
-  --from-file=config=merged -n logging
-
-# 3. Create database secret
-kubectl create secret generic logal-db \
-  --from-literal=url="postgres://logal:password@db-host:5432/logal" \
-  -n logging
-
-# 4. Deploy
-kubectl apply -f daemonset.yaml
-```
-
-### Add a New Cluster
+Use the central Deployment with **one replica** and no `NODE_NAME`. Each kubeconfig context gets its own collector and database cluster identity. Context names must remain stable. Do not run the DaemonSet against the same clusters/database simultaneously. A DaemonSet is for a single in-cluster installation; its stored identity is `in-cluster` (use a separate database for independent installations).
 
 ```bash
-# Update secret and restart
-kubectl create secret generic logal-kubeconfig \
-  --from-file=config=merged \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-kubectl rollout restart daemonset/logal -n logging
+kubectl create namespace logging
+KUBECONFIG=./kube-a:./kube-b kubectl config view --flatten > merged
+kubectl create secret generic logal-kubeconfig --from-file=config=merged -n logging
+kubectl create secret generic logal-db --from-literal=url="postgres://logal:password@db-host:5432/logal" -n logging
+kubectl create secret generic logal-auth -n logging \
+  --from-literal=username=admin --from-literal=password=change-this-password
+kubectl apply -f deployment-multicluster.yaml
 ```
+
+Kubeconfig credentials need read access to pods, pod logs, and workloads in each target cluster. External credential helper binaries must be available in the image if the kubeconfig uses them. The runtime image does not bundle cloud provider login tools.
+
+To add a cluster, merge its kubeconfig, then update the secret and restart:
+
+```bash
+kubectl create secret generic logal-kubeconfig -n logging \
+  --from-file=config=merged --dry-run=client -o yaml | kubectl apply -f -
+kubectl rollout restart deployment/logal -n logging
+```
+
+Authentication applies to UI, APIs, and SSE streams. `/healthz` is unauthenticated for Kubernetes probes. Basic Auth requires HTTPS when exposed outside a local port-forward. `ALLOWED_NAMESPACES` is enforced on both collection and direct API requests; credentials share the same namespace access.
+
+Older collector records stored under `kubeconfig` or `namespace/pod` cannot be safely assigned to a cluster/workload automatically. They remain in PostgreSQL until retention cleanup; new collection uses the corrected identities. No existing rows are rewritten. Collection is best effort; process restarts may replay recent lines and there is no exactly-once guarantee.
 
 ---
 
@@ -299,6 +311,7 @@ The migration reads files like `/data/logs/{cluster}/{namespace}/{workload}/YYYY
 
 # Or build + run manually
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/logal
+export AUTH_USERNAME=admin AUTH_PASSWORD=change-this-password
 go run .
 ```
 

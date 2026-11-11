@@ -38,7 +38,7 @@ fi
 echo "✓ kubeconfig: $KUBECONFIG"
 
 # Check DATABASE_URL
-echo "✓ database: $DATABASE_URL"
+echo "✓ database connection configured"
 echo ""
 
 echo "Starting LogaL on http://localhost:$PORT ..."

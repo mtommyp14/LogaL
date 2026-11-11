@@ -1145,7 +1145,7 @@ async function loadWorkloadInfo(workload) {
 
   try {
     const [ageRes, histRes] = await Promise.all([
-      fetch(`/api/pod-age?ctx=${enc(ctx)}&ns=${enc(ns)}&workload=${enc(workload)}`),
+      fetch(`/api/pod-age?ctx=${enc(ctx)}&ns=${enc(ns)}&workload=${enc(workload)}&kind=${enc(document.getElementById('kindSelect').value)}`),
       fetch(`/api/history-info?ctx=${enc(ctx)}&ns=${enc(ns)}&workload=${enc(workload)}`),
     ]);
     const age  = await ageRes.json();
@@ -1247,7 +1247,8 @@ async function startStream() {
   // Load pods + containers first
   await loadPodsForStream(ctx, ns, workload);
 
-  const params = { ctx, ns, workload, filter, since, tail, dtFrom, dtTo };
+  const kind = document.getElementById('kindSelect').value;
+  const params = { ctx, ns, workload, kind, filter, since, tail, dtFrom, dtTo };
 
   // Check volume warning
   const podCount = document.querySelectorAll('#podChips .selector-chip.checked').length;
@@ -1281,7 +1282,7 @@ function proceedStream() {
 
 function doStartStream(p, skipPodFilter = false) {
   stopStream();
-  clearLogs();
+  if (!skipPodFilter) clearLogs();
   saveSession();
   currentStreamParams = p;
   userStopped = false;
@@ -1299,6 +1300,7 @@ function doStartStream(p, skipPodFilter = false) {
   }
 
   let url = `/api/logs?ctx=${enc(p.ctx)}&ns=${enc(p.ns)}&workload=${enc(p.workload)}`;
+  if (p.kind) url += `&kind=${enc(p.kind)}`;
   if (p.filter)   url += `&filter=${enc(p.filter)}`;
   if (p.since !== 'custom' && p.since) url += `&since=${enc(p.since)}`;
   if (p.tail)     url += `&tail=${enc(p.tail)}`;
@@ -1320,9 +1322,7 @@ function doStartStream(p, skipPodFilter = false) {
   };
 
   eventSource.onmessage = (e) => {
-    const line = e.data
-      .replace(/\\n/g, '\n')
-      .replace(/\\t/g, '\t');
+    const line = e.data === '__END__' ? e.data : JSON.parse('"' + e.data + '"');
     appendLogLine(line);
   };
 

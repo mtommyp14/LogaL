@@ -16,11 +16,7 @@
 #     --from-literal=url="postgres://user:pass@host:5432/logal" -n logging
 #   kubectl apply -f daemonset.yaml
 #
-# Multi-cluster (optional):
-#   kubectl create secret generic logal-kubeconfig \
-#     --from-file=config=./merged-kubeconfig -n logging
-#   # then uncomment the KUBECONFIG env and kubeconfig volume below
-#   kubectl apply -f daemonset.yaml
+# For central multi-cluster collection use deployment-multicluster.yaml instead.
 
 ---
 apiVersion: v1
@@ -96,6 +92,16 @@ spec:
           name: http
 
         env:
+        - name: AUTH_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: logal-auth
+              key: username
+        - name: AUTH_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: logal-auth
+              key: password
         # Web server port
         - name: PORT
           value: "8080"
@@ -118,15 +124,6 @@ spec:
         # Empty means collect logs from all namespaces.
         # - name: ALLOWED_NAMESPACES
         #   value: "staging,production"
-        # Optional: multi-cluster support (requires kubeconfig volume below)
-        # - name: KUBECONFIG
-        #   value: "/kubeconfig/config"
-
-        volumeMounts:
-        # Optional: mount merged kubeconfig for multi-cluster mode
-        # - name: kubeconfig
-        #   mountPath: /kubeconfig
-        #   readOnly: true
 
         # Resource limits are intentionally generous because the pod runs
         # many concurrent kubectl log streams for the node.
@@ -140,23 +137,18 @@ spec:
 
         readinessProbe:
           httpGet:
-            path: /
+            path: /healthz
             port: 8080
           initialDelaySeconds: 5
           periodSeconds: 10
 
         livenessProbe:
           httpGet:
-            path: /
+            path: /healthz
             port: 8080
           initialDelaySeconds: 10
           periodSeconds: 30
 
-      volumes:
-      # Optional: merged kubeconfig for multi-cluster mode
-      # - name: kubeconfig
-      #   secret:
-      #     secretName: logal-kubeconfig
 
 ---
 # ── Service ───────────────────────────────────────────────────────────────────
@@ -192,7 +184,7 @@ spec:
 #   - host: logal.internal.example.com
 #     http:
 #       paths:
-#       - path: /
+#       - path: /healthz
 #         pathType: Prefix
 #         backend:
 #           service:
