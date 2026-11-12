@@ -1308,7 +1308,7 @@ function doStartStream(p, skipPodFilter = false) {
   if (p.kind) url += `&kind=${enc(p.kind)}`;
   if (p.filter)   url += `&filter=${enc(p.filter)}`;
   if (p.since !== 'custom' && p.since) url += `&since=${enc(p.since)}`;
-  if (p.tail)     url += `&tail=${enc(p.tail)}`;
+  if (p.since !== 'custom' && p.tail) url += `&tail=${enc(p.tail)}`;
   // dtFrom/dtTo are local time — new Date() treats datetime-local as local, toISOString() converts to UTC
   if (p.dtFrom)   url += `&from=${enc(new Date(p.dtFrom).toISOString())}`;
   if (p.dtTo)     url += `&to=${enc(new Date(p.dtTo).toISOString())}`;
@@ -1474,7 +1474,7 @@ function toggleChip(el) {
 
   // Normal container selected — restart live stream
   clearLogContent();
-  doStartStream({ ctx, ns, workload, filter, since, tail });
+  doStartStream({ ctx, ns, workload, kind: workloadKind(workload), filter, since, tail, dtFrom: document.getElementById('dtFrom').value, dtTo: document.getElementById('dtTo').value });
 }
 
 async function loadTerminatedContainerLogs(ctx, ns, pod, container) {

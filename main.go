@@ -1210,13 +1210,15 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tail := 100
-	if value := q.Get("tail"); value != "" {
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 0 {
-			http.Error(w, "invalid tail count", 400)
-			return
+	if fromStr == "" {
+		if value := q.Get("tail"); value != "" {
+			parsed, err := strconv.Atoi(value)
+			if err != nil || parsed < 0 {
+				http.Error(w, "invalid tail count", 400)
+				return
+			}
+			tail = parsed
 		}
-		tail = parsed
 	}
 	if tail == 0 {
 		tail = -1

@@ -126,6 +126,7 @@ func TestInvalidLogRanges(t *testing.T) {
 		"from=invalid", "from=2026-01-02T00:00:00Z&to=invalid",
 		"from=2026-01-02T00:00:00Z&to=2026-01-01T00:00:00Z",
 		"to=2026-01-02T00:00:00Z", "since=invalid", "since=-1h",
+		"from=2026-01-02T00:00:00Z&tail=nope",
 	} {
 		w := httptest.NewRecorder()
 		handleLogs(w, httptest.NewRequest("GET", "/api/logs?ns=production&workload=api&"+query, nil))
