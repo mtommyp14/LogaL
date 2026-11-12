@@ -475,6 +475,10 @@ func insertLogLine(ctx context.Context, l LogLine) error {
 // streamHistoryFiles streams historical log lines from PostgreSQL for the given date range.
 // Output lines use the same plain-text format as the original flat files.
 func streamHistoryFiles(ctx context.Context, cluster, ns, workload string, since time.Time, until *time.Time, filter, pods, containers string, out chan<- string) {
+	if dbPool == nil {
+		log.Printf("[history] database pool uninitialized")
+		return
+	}
 	args := []interface{}{cluster, ns, workload, since.UTC()}
 	sql := `SELECT ts, pod, container, level, message FROM logs
 	        WHERE cluster=$1 AND namespace=$2 AND workload=$3 AND ts >= $4`
