@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	_ "embed"
@@ -36,6 +39,118 @@ var (
 )
 
 var dbPool *pgxpool.Pool
+
+type CollectionConfig struct {
+	RetentionDays int      `json:"retentionDays"`
+	AllWorkloads  bool     `json:"allWorkloads"`
+	Workloads     []string `json:"workloads"`
+}
+
+var (
+	configWriteMu sync.Mutex
+	configMu      sync.RWMutex
+	currentConfig = CollectionConfig{
+		RetentionDays: retentionDays,
+		AllWorkloads:  true,
+		Workloads:     []string{},
+	}
+)
+
+func getCollectionConfig() CollectionConfig {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	return currentConfig
+}
+
+func setCollectionConfig(cfg CollectionConfig) {
+	configMu.Lock()
+	currentConfig = cfg
+	configMu.Unlock()
+}
+
+func isWorkloadSelected(cluster, ns, workload string) bool {
+	cfg := getCollectionConfig()
+	if cfg.AllWorkloads {
+		return true
+	}
+	for _, w := range cfg.Workloads {
+		w = strings.TrimSpace(w)
+		if w == "" {
+			continue
+		}
+		if w == cluster+"/"+ns+"/"+workload {
+			return true
+		}
+	}
+	return false
+}
+
+func saveConfigToDB(ctx context.Context, cfg CollectionConfig) error {
+	if dbPool == nil {
+		return fmt.Errorf("database not initialized")
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	_, err = dbPool.Exec(ctx, `
+		INSERT INTO settings (key, value, updated_at)
+		VALUES ('collection', $1, now())
+		ON CONFLICT (key) DO UPDATE
+		SET value = EXCLUDED.value, updated_at = now()
+	`, data)
+	return err
+}
+
+func syncConfigFromDB(ctx context.Context) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+	if dbPool == nil {
+		return nil
+	}
+	var raw []byte
+	err := dbPool.QueryRow(ctx, `SELECT value FROM settings WHERE key = 'collection'`).Scan(&raw)
+	if err != nil {
+		return err
+	}
+	var cfg CollectionConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return err
+	}
+	curr := getCollectionConfig()
+	if curr.RetentionDays != cfg.RetentionDays || curr.AllWorkloads != cfg.AllWorkloads || !slicesEqual(curr.Workloads, cfg.Workloads) {
+		setCollectionConfig(cfg)
+		reconcileAllCollectors()
+	}
+	return nil
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func startConfigSync(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = syncConfigFromDB(ctx)
+			}
+		}
+	}()
+}
 
 func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -350,15 +465,17 @@ func handlePodAge(w http.ResponseWriter, r *http.Request) {
 	}
 
 	maxH := ageHours
-	if maxH > retentionDays*24 {
-		maxH = retentionDays * 24
+	if maxH > getCollectionConfig().RetentionDays*24 {
+		maxH = getCollectionConfig().RetentionDays * 24
 	}
 
 	// Check if database history exists for this workload
 	var hasCache bool
-	_ = dbPool.QueryRow(r.Context(),
-		`SELECT EXISTS(SELECT 1 FROM logs WHERE cluster=$1 AND namespace=$2 AND workload=$3 LIMIT 1)`,
-		ctxName, ns, workload).Scan(&hasCache)
+	if dbPool != nil {
+		_ = dbPool.QueryRow(r.Context(),
+			`SELECT EXISTS(SELECT 1 FROM logs WHERE cluster=$1 AND namespace=$2 AND workload=$3 LIMIT 1)`,
+			ctxName, ns, workload).Scan(&hasCache)
+	}
 
 	jsonResp(w, PodAge{
 		PodName:      podName,
@@ -456,11 +573,55 @@ func initDB(ctx context.Context) (*pgxpool.Pool, error) {
 		CREATE INDEX IF NOT EXISTS idx_logs_lookup ON logs(cluster, namespace, workload, ts);
 		CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
 		CREATE INDEX IF NOT EXISTS idx_logs_message ON logs USING gin(to_tsvector('english', message));
+		CREATE TABLE IF NOT EXISTS settings (
+			key         TEXT PRIMARY KEY,
+			value       JSONB NOT NULL,
+			updated_at  TIMESTAMPTZ DEFAULT now()
+		);
 	`)
 	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
+
+	var raw []byte
+	err = pool.QueryRow(ctx, `SELECT value FROM settings WHERE key = 'collection'`).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		defaultCfg := CollectionConfig{
+			RetentionDays: retentionDays,
+			AllWorkloads:  true,
+			Workloads:     []string{},
+		}
+		data, marshalErr := json.Marshal(defaultCfg)
+		if marshalErr != nil {
+			pool.Close()
+			return nil, fmt.Errorf("marshal default collection settings: %w", marshalErr)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO settings (key, value) VALUES ('collection', $1) ON CONFLICT (key) DO NOTHING`, data); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("insert default collection settings: %w", err)
+		} else if err := pool.QueryRow(ctx, `SELECT value FROM settings WHERE key = 'collection'`).Scan(&raw); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("load collection settings after insert: %w", err)
+		}
+		var cfg CollectionConfig
+		if err := decodeCollectionConfig(raw, &cfg); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("invalid stored collection settings: %w", err)
+		}
+		setCollectionConfig(cfg)
+	} else if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("load collection settings: %w", err)
+	} else {
+		var cfg CollectionConfig
+		if err := decodeCollectionConfig(raw, &cfg); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("invalid stored collection settings: %w", err)
+		}
+		setCollectionConfig(cfg)
+	}
+
 	return pool, nil
 }
 
@@ -537,20 +698,103 @@ type containerKey struct {
 }
 
 // podContainerState holds the cancel function for a running container stream.
+type podDetails struct {
+	workload   string
+	containers []string
+}
+
 type collectorState struct {
-	mu       sync.Mutex
-	cluster  string
-	streams  map[containerKey]context.CancelFunc
-	podNames map[podKey]bool
+	mu          sync.Mutex
+	ctx         context.Context
+	cluster     string
+	streams     map[containerKey]context.CancelFunc
+	podNames    map[podKey]bool
+	pods        map[podKey]podDetails
+	startStream func(ctx context.Context, cluster, ns, workload, pod, container string)
+}
+
+func (s *collectorState) rootContext() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+
+func (s *collectorState) streamContainer(ctx context.Context, cluster, ns, workload, pod, container string) {
+	if s.startStream != nil {
+		s.startStream(ctx, cluster, ns, workload, pod, container)
+		return
+	}
+	streamContainerLogsForCollector(ctx, cluster, ns, workload, pod, container)
+}
+
+func (s *collectorState) reconcile() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for pk, details := range s.pods {
+		selected := isWorkloadSelected(s.cluster, pk.Namespace, details.workload)
+		for _, c := range details.containers {
+			ck := containerKey{podKey: pk, Container: c}
+			cancel, running := s.streams[ck]
+			if selected && !running {
+				cctx, cCancel := context.WithCancel(s.rootContext())
+				s.streams[ck] = cCancel
+				go s.streamContainer(cctx, s.cluster, pk.Namespace, details.workload, pk.Name, c)
+				log.Printf("[collector] started stream %s/%s/%s", pk.Namespace, pk.Name, c)
+			} else if !selected && running {
+				cancel()
+				delete(s.streams, ck)
+				log.Printf("[collector] stopped stream %s/%s/%s (deselected)", pk.Namespace, pk.Name, c)
+			}
+		}
+	}
+}
+
+var (
+	collectorsMu     sync.Mutex
+	activeCollectors []*collectorState
+)
+
+func registerCollector(s *collectorState) {
+	collectorsMu.Lock()
+	activeCollectors = append(activeCollectors, s)
+	collectorsMu.Unlock()
+}
+
+func unregisterCollector(s *collectorState) {
+	collectorsMu.Lock()
+	defer collectorsMu.Unlock()
+	for i, c := range activeCollectors {
+		if c == s {
+			activeCollectors = append(activeCollectors, activeCollectors[i+1:]...)
+			break
+		}
+	}
+}
+
+func reconcileAllCollectors() {
+	collectorsMu.Lock()
+	cols := make([]*collectorState, len(activeCollectors))
+	copy(cols, activeCollectors)
+	collectorsMu.Unlock()
+
+	for _, c := range cols {
+		c.reconcile()
+	}
 }
 
 // runLogCollector watches pods in one context and persists their container logs.
 func runLogCollector(ctx context.Context, cluster string) {
 	state := &collectorState{
+		ctx:      ctx,
 		cluster:  cluster,
 		streams:  make(map[containerKey]context.CancelFunc),
 		podNames: make(map[podKey]bool),
+		pods:     make(map[podKey]podDetails),
 	}
+	registerCollector(state)
+	defer unregisterCollector(state)
 
 	for {
 		select {
@@ -741,6 +985,7 @@ func (s *collectorState) handlePodEvent(ctx context.Context, e podWatchEvent) {
 
 	// Ignore pods that are not yet running or already terminating.
 	if !namespaceAllowed(ns) {
+		s.stopPod(key)
 		return
 	}
 	if phase != "Running" && phase != "Pending" {
@@ -766,16 +1011,39 @@ func (s *collectorState) handlePodEvent(ctx context.Context, e podWatchEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.podNames == nil {
+		s.podNames = make(map[podKey]bool)
+	}
+	if s.pods == nil {
+		s.pods = make(map[podKey]podDetails)
+	}
+
 	s.podNames[key] = true
+	s.pods[key] = podDetails{
+		workload:   workload,
+		containers: containers,
+	}
+
+	if !isWorkloadSelected(s.cluster, ns, workload) {
+		for _, c := range containers {
+			ck := containerKey{podKey: key, Container: c}
+			if cancel, ok := s.streams[ck]; ok {
+				cancel()
+				delete(s.streams, ck)
+				log.Printf("[collector] stopped %s/%s/%s (filtered)", ns, pod, c)
+			}
+		}
+		return
+	}
 
 	for _, c := range containers {
 		ck := containerKey{podKey: key, Container: c}
 		if _, ok := s.streams[ck]; ok {
 			continue
 		}
-		cctx, cancel := context.WithCancel(ctx)
+		cctx, cancel := context.WithCancel(s.rootContext())
 		s.streams[ck] = cancel
-		go streamContainerLogsForCollector(cctx, s.cluster, ns, workload, pod, c)
+		go s.streamContainer(cctx, s.cluster, ns, workload, pod, c)
 		log.Printf("[collector] started %s/%s/%s", ns, pod, c)
 	}
 }
@@ -784,6 +1052,7 @@ func (s *collectorState) stopPod(key podKey) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.podNames, key)
+	delete(s.pods, key)
 	for ck, cancel := range s.streams {
 		if ck.podKey == key {
 			cancel()
@@ -801,6 +1070,7 @@ func (s *collectorState) stopAll() {
 	}
 	s.streams = make(map[containerKey]context.CancelFunc)
 	s.podNames = make(map[podKey]bool)
+	s.pods = make(map[podKey]podDetails)
 	log.Printf("[collector] stopped all streams")
 }
 
@@ -914,8 +1184,39 @@ func startCleanup() {
 }
 
 func cleanOldLogs() {
-	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
-	_, err := dbPool.Exec(context.Background(),
+	if dbPool == nil {
+		return
+	}
+	days := getCollectionConfig().RetentionDays
+	if days <= 0 || days > 365 {
+		days = retentionDays
+		if days <= 0 || days > 365 {
+			days = 3
+		}
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -days)
+	ctx := context.Background()
+	conn, err := dbPool.Acquire(ctx)
+	if err != nil {
+		log.Printf("[cleanup] acquire connection error: %v", err)
+		return
+	}
+	defer conn.Release()
+	var locked bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(714329018241)`).Scan(&locked); err != nil {
+		log.Printf("[cleanup] lock error: %v", err)
+		return
+	}
+	if !locked {
+		return
+	}
+	defer func() {
+		var released bool
+		if err := conn.QueryRow(ctx, `SELECT pg_advisory_unlock(714329018241)`).Scan(&released); err != nil {
+			log.Printf("[cleanup] unlock error: %v", err)
+		}
+	}()
+	_, err = conn.Exec(ctx,
 		`DELETE FROM logs WHERE ts < $1`, cutoff)
 	if err != nil {
 		log.Printf("[cleanup] delete old logs error: %v", err)
@@ -1347,6 +1648,10 @@ type HistoryInfo struct {
 }
 
 func handleHistoryInfo(w http.ResponseWriter, r *http.Request) {
+	if dbPool == nil {
+		jsonResp(w, HistoryInfo{Available: false})
+		return
+	}
 	ctxName := r.URL.Query().Get("ctx")
 	ns := r.URL.Query().Get("ns")
 	workload := r.URL.Query().Get("workload")
@@ -1402,10 +1707,85 @@ func jsonResp(w http.ResponseWriter, v interface{}) {
 
 // ── API: config ───────────────────────────────────────────────────────────────
 
+func decodeCollectionConfig(data []byte, cfg *CollectionConfig) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil || fields == nil {
+		return fmt.Errorf("expected config object")
+	}
+	if len(fields) != 3 {
+		return fmt.Errorf("all config fields required")
+	}
+	for _, key := range []string{"retentionDays", "allWorkloads", "workloads"} {
+		if _, ok := fields[key]; !ok {
+			return fmt.Errorf("missing field %s", key)
+		}
+	}
+	for key := range fields {
+		if key != "retentionDays" && key != "allWorkloads" && key != "workloads" {
+			return fmt.Errorf("unknown field %s", key)
+		}
+	}
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	return d.Decode(cfg)
+}
+
 func handleConfig(w http.ResponseWriter, r *http.Request) {
-	jsonResp(w, map[string]interface{}{
-		"retentionDays": retentionDays,
-	})
+	if r.Method == http.MethodGet {
+		jsonResp(w, getCollectionConfig())
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1048577))
+	if err != nil || len(body) > 1048576 {
+		http.Error(w, "read error or body too large", http.StatusBadRequest)
+		return
+	}
+
+	var req CollectionConfig
+	if err := decodeCollectionConfig(body, &req); err != nil {
+		http.Error(w, "invalid config: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.RetentionDays < 1 || req.RetentionDays > 365 {
+		http.Error(w, "retentionDays must be between 1 and 365", http.StatusBadRequest)
+		return
+	}
+
+	for _, wName := range req.Workloads {
+		wName = strings.TrimSpace(wName)
+		parts := strings.Split(wName, "/")
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			http.Error(w, "workloads must be cluster/namespace/name", http.StatusBadRequest)
+			return
+		}
+		ns := parts[1]
+		if ns != "" && !namespaceAllowed(ns) {
+			http.Error(w, "forbidden namespace: "+ns, http.StatusForbidden)
+			return
+		}
+	}
+
+	if dbPool != nil {
+		if err := saveConfigToDB(r.Context(), req); err != nil {
+			log.Printf("[config] save error: %v", err)
+			http.Error(w, "failed to save settings: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	setCollectionConfig(req)
+	reconcileAllCollectors()
+
+	jsonResp(w, req)
 }
 
 // ── API: container logs (for terminated/init containers) ──────────────────────
@@ -1475,6 +1855,9 @@ func main() {
 
 	// Start cleanup goroutine
 	startCleanup()
+
+	// Start periodic config sync across DaemonSet pods
+	startConfigSync(ctx)
 
 	// Start node-local log collector (DaemonSet mode).
 	// If NODE_NAME is empty it falls back to collecting from all nodes.

@@ -41,8 +41,12 @@ func protect(next http.Handler) http.Handler {
 			}
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			http.Error(w, "method not allowed", 405)
-			return
+			if r.Method == http.MethodPost && r.URL.Path == "/api/config" {
+				// allowed for settings update
+			} else {
+				http.Error(w, "method not allowed", 405)
+				return
+			}
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			if ns := r.URL.Query().Get("ns"); ns != "" && !namespaceAllowed(ns) {

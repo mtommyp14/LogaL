@@ -377,6 +377,29 @@
     justify-content: flex-end;
   }
 
+  /* ── Settings modal ── */
+  .settings-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.7);
+    z-index: 200;
+    align-items: center;
+    justify-content: center;
+  }
+  .settings-overlay.show { display: flex; }
+
+  .settings-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    max-width: 520px;
+    width: 90%;
+    max-height: 85vh;
+    overflow-y: auto;
+  }
+
   /* ── Log area ── */
   .log-wrap {
     flex: 1;
@@ -664,6 +687,7 @@
         <span id="statusText">idle</span>
       </span>
       <span id="tzDisplay"></span>
+      <button class="btn" id="settingsBtn" onclick="openSettingsModal()" style="padding:3px 9px;font-size:11px;display:inline-flex;align-items:center;gap:4px" title="Pengaturan koleksi log">⚙ Settings</button>
       <span>v1.0.0</span>
     </div>
   </header>
@@ -795,6 +819,65 @@
     </div>
   </div>
 
+  <!-- Settings Modal -->
+  <div class="settings-overlay" id="settingsOverlay">
+    <div class="settings-box">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;border-bottom:1px solid var(--border);padding-bottom:8px">
+        <h3 style="margin:0;font-size:15px;color:var(--text);font-weight:600">⚙ Collection Settings</h3>
+        <button class="btn" onclick="closeSettingsModal()" style="padding:2px 8px;font-size:12px">✕</button>
+      </div>
+
+      <div style="margin-bottom:16px">
+        <label style="display:block;font-size:12px;font-weight:600;margin-bottom:6px;color:var(--text-dim)">Log Retention</label>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="number" id="settingRetentionDays" min="1" max="365" style="width:90px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:6px;font-size:13px">
+          <span style="font-size:12px;color:var(--text-dim)">hari / days</span>
+        </div>
+      </div>
+
+      <div style="margin-bottom:16px">
+        <label style="display:block;font-size:12px;font-weight:600;margin-bottom:8px;color:var(--text-dim)">Workload Persistence (PostgreSQL)</label>
+        <div style="display:flex;flex-direction:column;gap:8px;font-size:12px">
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="radio" name="workloadMode" id="modeAllWorkloads" value="all" onchange="onWorkloadModeChange()">
+            <span>Simpan semua workload (Collect all workloads)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="radio" name="workloadMode" id="modeSelectedWorkloads" value="selected" onchange="onWorkloadModeChange()">
+            <span>Hanya workload tertentu (Collect selected workloads only)</span>
+          </label>
+        </div>
+      </div>
+
+      <div id="workloadPickerArea" style="display:none;margin-bottom:16px;border:1px solid var(--border);border-radius:6px;padding:12px;background:var(--surface2)">
+        <div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">
+          Pilih namespace dan tandai workload yang ingin disimpan ke database:
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:8px">
+          <select id="settingsCtxSelect" onchange="loadSettingsNamespaces()" style="flex:1;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px"></select>
+          <select id="settingsNsSelect" onchange="onSettingsNsChange()" style="flex:1;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+            <option value="">Pilih namespace...</option>
+          </select>
+        </div>
+        <div id="settingsWorkloadList" style="max-height:160px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;border:1px solid var(--border);border-radius:4px;padding:6px;background:var(--surface)">
+          <span style="font-size:11px;color:var(--text-dim)">Pilih namespace di atas untuk memuat daftar workload</span>
+        </div>
+
+        <div style="margin-top:10px">
+          <div style="font-size:11px;font-weight:600;margin-bottom:4px;color:var(--text-dim)">Workload Terpilih (<span id="selectedCount">0</span>):</div>
+          <div id="selectedWorkloadChips" style="display:flex;flex-wrap:wrap;gap:4px;max-height:100px;overflow-y:auto"></div>
+        </div>
+      </div>
+
+      <div id="settingsMsg" style="display:none;font-size:12px;padding:8px;border-radius:4px;margin-bottom:12px"></div>
+
+      <div class="btns" style="display:flex;justify-content:flex-end;gap:8px">
+        <button class="btn" onclick="closeSettingsModal()">Batal</button>
+        <button class="btn btn-primary" id="saveSettingsBtn" onclick="saveSettings()">Simpan</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Log area -->
   <div class="log-wrap">
     <div class="log-toolbar">
@@ -893,7 +976,11 @@ function buildSinceSelect() {
     { h: 6, label: '6 hours' },
     { d: 1, label: '1 day' },
     { d: 2, label: '2 days' },
-    { d: 3, label: '3 days' }
+    { d: 3, label: '3 days' },
+    { d: 7, label: '7 days' },
+    { d: 14, label: '14 days' },
+    { d: 30, label: '30 days' },
+    { d: 90, label: '90 days' }
   ];
   for (const p of presets) {
     let value, label, days;
@@ -1791,6 +1878,166 @@ function escHtml(s) {
 }
 
 function enc(s) { return encodeURIComponent(s || ''); }
+
+// ── Admin Settings Modal ────────────────────────────────────────────────────────
+let editingWorkloads = new Set();
+
+function openSettingsModal() {
+  document.getElementById('settingRetentionDays').value = appConfig.retentionDays || 3;
+  const isAll = appConfig.allWorkloads !== false;
+  document.getElementById('modeAllWorkloads').checked = isAll;
+  document.getElementById('modeSelectedWorkloads').checked = !isAll;
+
+  editingWorkloads = new Set(appConfig.workloads || []);
+  renderSelectedChips();
+  onWorkloadModeChange();
+
+  const ctxSel = document.getElementById('settingsCtxSelect');
+  ctxSel.innerHTML = Array.from(document.getElementById('ctxSelect').options).map(o => `<option value="${esc(o.value)}">${esc(o.textContent)}</option>`).join('');
+  ctxSel.value = document.getElementById('ctxSelect').value;
+  loadSettingsNamespaces();
+
+  const msg = document.getElementById('settingsMsg');
+  msg.style.display = 'none';
+  document.getElementById('settingsOverlay').classList.add('show');
+}
+
+function closeSettingsModal() {
+  document.getElementById('settingsOverlay').classList.remove('show');
+}
+
+function onWorkloadModeChange() {
+  const isSelected = document.getElementById('modeSelectedWorkloads').checked;
+  document.getElementById('workloadPickerArea').style.display = isSelected ? 'block' : 'none';
+}
+
+async function loadSettingsNamespaces() {
+  const ctx = document.getElementById('settingsCtxSelect').value;
+  const select = document.getElementById('settingsNsSelect');
+  select.innerHTML = '<option value="">Loading...</option>';
+  try { const r = await fetch(`/api/namespaces?ctx=${enc(ctx)}`); if (!r.ok) throw new Error(await r.text()); const ns = await r.json(); select.innerHTML = '<option value="">Choose namespace...</option>' + ns.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join(''); }
+  catch(e) { select.innerHTML = '<option value="">Failed to load namespaces</option>'; }
+}
+
+async function onSettingsNsChange() {
+  const ns = document.getElementById('settingsNsSelect').value;
+  const listEl = document.getElementById('settingsWorkloadList');
+  if (!ns) {
+    listEl.innerHTML = '<span style="font-size:11px;color:var(--text-dim)">Pilih namespace di atas untuk memuat daftar workload</span>';
+    return;
+  }
+  const ctx = document.getElementById('settingsCtxSelect').value;
+  listEl.innerHTML = '<span style="font-size:11px;color:var(--text-dim)">Memuat workload...</span>';
+  try {
+    const res = await fetch(`/api/workloads?ctx=${enc(ctx)}&ns=${enc(ns)}`);
+    if (!res.ok) throw new Error(await res.text());
+    const workloads = await res.json();
+    if (!workloads || workloads.length === 0) {
+      listEl.innerHTML = '<span style="font-size:11px;color:var(--text-dim)">Tidak ada workload di namespace ini</span>';
+      return;
+    }
+    listEl.innerHTML = workloads.map(w => {
+      const fullKey = `${ctx}/${ns}/${w.name}`;
+      const checked = editingWorkloads.has(fullKey) ? 'checked' : '';
+      return `<label style="display:flex;align-items:center;gap:6px;font-size:12px;padding:2px 0;cursor:pointer">
+        <input type="checkbox" value="${esc(fullKey)}" ${checked} onchange="toggleWorkloadItem('${esc(fullKey)}', this.checked)">
+        <span><strong>${esc(w.kind)}</strong> / ${esc(w.name)}</span>
+      </label>`;
+    }).join('');
+  } catch (e) {
+    listEl.innerHTML = `<span style="font-size:11px;color:var(--error)">Gagal memuat: ${esc(e.message)}</span>`;
+  }
+}
+
+function toggleWorkloadItem(fullKey, isChecked) {
+  if (isChecked) {
+    editingWorkloads.add(fullKey);
+  } else {
+    editingWorkloads.delete(fullKey);
+    const short = fullKey.split('/')[1];
+    if (short) editingWorkloads.delete(short);
+  }
+  renderSelectedChips();
+}
+
+function removeSelectedChip(fullKey) {
+  editingWorkloads.delete(fullKey);
+  const short = fullKey.split('/')[1];
+  if (short) editingWorkloads.delete(short);
+  renderSelectedChips();
+  const list = document.getElementById('settingsWorkloadList');
+  for (const input of list.querySelectorAll('input[type=checkbox]')) {
+    if (input.value === fullKey) input.checked = false;
+  }
+}
+
+function renderSelectedChips() {
+  const chipsEl = document.getElementById('selectedWorkloadChips');
+  const countEl = document.getElementById('selectedCount');
+  countEl.textContent = editingWorkloads.size;
+  if (editingWorkloads.size === 0) {
+    chipsEl.innerHTML = '<span style="font-size:11px;color:var(--text-dim)">(Belum ada workload dipilih)</span>';
+    return;
+  }
+  chipsEl.innerHTML = Array.from(editingWorkloads).map(w => {
+    return `<span class="chip" style="font-size:11px;display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);padding:2px 6px;border-radius:4px">
+      ${esc(w)}
+      <span onclick="removeSelectedChip('${esc(w)}')" style="cursor:pointer;color:var(--error);font-weight:bold;margin-left:2px">✕</span>
+    </span>`;
+  }).join('');
+}
+
+async function saveSettings() {
+  const retVal = parseInt(document.getElementById('settingRetentionDays').value, 10);
+  const msg = document.getElementById('settingsMsg');
+  if (isNaN(retVal) || retVal < 1 || retVal > 365) {
+    msg.style.display = 'block';
+    msg.style.background = 'rgba(239,68,68,0.2)';
+    msg.style.color = 'var(--error)';
+    msg.textContent = 'Retention days harus antara 1 dan 365 hari.';
+    return;
+  }
+
+  const isAll = document.getElementById('modeAllWorkloads').checked;
+  const payload = {
+    retentionDays: retVal,
+    allWorkloads: isAll,
+    workloads: isAll ? [] : Array.from(editingWorkloads)
+  };
+
+  const btn = document.getElementById('saveSettingsBtn');
+  btn.disabled = true;
+  btn.textContent = 'Menyimpan...';
+
+  try {
+    const res = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      throw new Error(await res.text());
+    }
+    appConfig = await res.json();
+    buildSinceSelect();
+    msg.style.display = 'block';
+    msg.style.background = 'rgba(34,197,94,0.2)';
+    msg.style.color = '#22c55e';
+    msg.textContent = 'Pengaturan berhasil disimpan!';
+    setTimeout(() => {
+      closeSettingsModal();
+      showToast('Pengaturan koleksi log berhasil diperbarui');
+    }, 600);
+  } catch (err) {
+    msg.style.display = 'block';
+    msg.style.background = 'rgba(239,68,68,0.2)';
+    msg.style.color = 'var(--error)';
+    msg.textContent = 'Gagal menyimpan: ' + err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Simpan';
+  }
+}
 </script>
 </body>
 </html>

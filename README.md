@@ -62,7 +62,8 @@ kubectl port-forward -n logging svc/logal 8080:80
 - **Distributed load** — each pod only watches a small number of local pods, so it scales with the cluster.
 - **Dark theme** UI optimized for long log sessions.
 - **Real-time streaming** via Server-Sent Events (`kubectl logs`).
-- **Persistent history** in PostgreSQL with configurable retention (`LOG_RETENTION_DAYS`).
+- **Persistent history** in PostgreSQL with configurable retention (1–365 days).
+- **Collection Settings** in the UI: persist all workloads or select exact cluster/namespace/workload identities; choose retention duration. Settings are stored in PostgreSQL and shared across collector pods.
 - **Custom time range** picker with live UTC hints and per-row filtering.
 - **Multi-pod / multi-container** selector, smart sidecar OFF by default.
 - **Grep filter** applied both in real-time and history.
@@ -70,6 +71,24 @@ kubectl port-forward -n logging svc/logal 8080:80
 - **Date dividers** and **UTC timestamps**.
 - **Copy & download** logs.
 - **Auto-reconnect** on pod restart / network blip.
+
+## Screenshots
+
+### Home
+
+![LogaL home screen](docs/screenshots/01-home.png)
+
+### Live Kubernetes logs
+
+![Streaming demo-api logs](docs/screenshots/02-demo-api-logs.png)
+
+### Collection settings — save all workloads
+
+![Collection settings with all workloads selected](docs/screenshots/03-collection-settings.png)
+
+### Collection settings — save selected workload
+
+![Collection settings selecting demo-api in logal-sandbox](docs/screenshots/04-specific-workload-selection.png)
 
 ---
 
